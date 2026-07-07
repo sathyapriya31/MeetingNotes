@@ -62,6 +62,7 @@ WhisperKit require Apple Silicon.)
 - LLM: `mlx-community/Qwen2.5-3B-Instruct-4bit` (~1.8 GB). On 16 GB+ Macs,
   `Qwen2.5-7B-Instruct-4bit` (~4.3 GB) gives noticeably better summaries.
 
+<!--
 ## Distribution notes
 
 - Direct distribution: Developer ID + notarization, nothing exotic here.
@@ -76,3 +77,4 @@ WhisperKit require Apple Silicon.)
   online). Live view shows "You / Them" from the two channels instead.
 - Word-level timestamp alignment between Whisper segments and diarizer turns
   is nearest-overlap; refine if you need broadcast-grade attribution.
+-->
