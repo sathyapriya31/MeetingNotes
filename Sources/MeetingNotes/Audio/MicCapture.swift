@@ -16,6 +16,13 @@ final class MicCapture {
     func start(onSamples: @escaping ([Float]) -> Void) throws {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
+        // A 0 Hz / 0-channel format means the process has no microphone access
+        // (TCC not granted) or no input device exists. Installing a tap with it
+        // faults deep in CoreAudio (kAudioUnitErr_FormatNotSupported, -10868),
+        // so fail with something actionable instead.
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw CaptureError.microphoneUnavailable
+        }
         converter = AVAudioConverter(from: inputFormat, to: Self.targetFormat)
 
         input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
@@ -42,5 +49,12 @@ final class MicCapture {
     func stop() {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+    }
+
+    enum CaptureError: Error, LocalizedError {
+        case microphoneUnavailable
+        var errorDescription: String? {
+            "Microphone unavailable. Grant Microphone access in System Settings → Privacy & Security (when launching from a terminal or IDE, grant it to that app), then retry."
+        }
     }
 }

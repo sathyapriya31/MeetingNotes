@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 @main
 struct MeetingNotesApp: App {
@@ -44,6 +45,17 @@ final class MeetingCoordinator: ObservableObject {
 
     func startMeeting() async {
         guard !isRecording else { return }
+
+        // Ask for mic access before touching AVAudioEngine — with access not
+        // yet granted the input node reports an invalid HW format and CoreAudio
+        // faults instead of prompting.
+        status = "Requesting microphone access…"
+        let granted = await AVCaptureDevice.requestAccess(for: .audio)
+        guard granted else {
+            status = "Microphone access denied — enable it in System Settings → Privacy & Security → Microphone."
+            return
+        }
+
         status = "Loading models…"
         do {
             try await transcriber.prepare()   // downloads Whisper on first run
