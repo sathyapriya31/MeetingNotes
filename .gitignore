@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Swift Package Manager
+.build/
+.swiftpm/
+packages/
+Package.resolved
+
+# Xcode (if project is opened in Xcode)
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+derivedData/
+DerivedData/
+*.moved-aside
+*.xcuserstate
