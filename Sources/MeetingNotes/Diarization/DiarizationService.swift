@@ -23,19 +23,43 @@ final class DiarizationService {
             )
 
             // Map each "Them" transcript segment to the diarizer turn with
-            // the largest time overlap.
-            return segments.map { seg in
-                guard seg.channel == .system else { return seg }
-                var best: (overlap: Double, speaker: String)? = nil
+            // the largest time overlap. A segment that overlaps no turn
+            // (diarizer gaps, slight timing skew) takes the *nearest* turn —
+            // falling back to "Them" per segment would mix two label schemes
+            // in one transcript.
+            var assigned: [UUID: String] = [:]
+            for seg in segments where seg.channel == .system {
+                var bestId: String? = nil
+                var bestScore = -Double.infinity
                 for turn in result.segments {
-                    let overlap = min(seg.end, Double(turn.endTimeSeconds))
-                                - max(seg.start, Double(turn.startTimeSeconds))
-                    if overlap > 0, overlap > (best?.overlap ?? 0) {
-                        best = (overlap, "Speaker \(turn.speakerId)")
+                    let start = Double(turn.startTimeSeconds)
+                    let end = Double(turn.endTimeSeconds)
+                    let overlap = min(seg.end, end) - max(seg.start, start)
+                    let mid = (seg.start + seg.end) / 2
+                    let score = overlap > 0 ? overlap : -min(abs(mid - start), abs(mid - end))
+                    if score > bestScore {
+                        bestScore = score
+                        bestId = "\(turn.speakerId)"
                     }
                 }
+                if let bestId { assigned[seg.id] = bestId }
+            }
+
+            // Raw diarizer IDs are arbitrary ("Speaker 2" with no Speaker 1).
+            // Renumber by first appearance; a single remote voice just stays
+            // "Them" alongside the mic's "You".
+            var labelFor: [String: String] = [:]
+            if Set(assigned.values).count > 1 {
+                for seg in segments.sorted(by: { $0.start < $1.start }) {
+                    guard let id = assigned[seg.id], labelFor[id] == nil else { continue }
+                    labelFor[id] = "Speaker \(labelFor.count + 1)"
+                }
+            }
+
+            return segments.map { seg in
+                guard seg.channel == .system else { return seg }
                 var updated = seg
-                updated.speaker = best?.speaker ?? "Them"
+                updated.speaker = assigned[seg.id].flatMap { labelFor[$0] } ?? "Them"
                 return updated
             }
         } catch {

@@ -25,13 +25,19 @@ final class TranscriptionService {
     private var elapsed: [AudioChannel: Double] = [.mic: 0, .system: 0]
     private var allSegments: [TranscriptSegment] = []
     private let windowSeconds: Double = 15
+    private let overlapSeconds: Double = 1
     private let sampleRate: Double = 16_000
 
-    /// Downloads/loads the model on first run. "small" balances speed and
-    /// accuracy; use "large-v3-turbo" (still fast on ANE) for best accuracy.
+    /// Downloads/loads the model on first run (~1.5 GB, then cached; the first
+    /// launch also spends a few minutes on ANE specialization).
+    /// "large-v3-v20240930" is WhisperKit's name for large-v3-turbo. If RAM is
+    /// tight (8 GB Macs), "large-v3-v20240930_626MB" is the quantized variant;
+    /// "small" is the fast/light fallback.
+    private static let model = "large-v3-v20240930"
+
     func prepare() async throws {
         guard whisper == nil else { return }
-        whisper = try await WhisperKit(WhisperKitConfig(model: "small"))  // CHECK-API
+        whisper = try await WhisperKit(WhisperKitConfig(model: Self.model))  // CHECK-API
     }
 
     func feed(_ samples: [Float], channel: AudioChannel, onSegment: @escaping (TranscriptSegment) -> Void) {
@@ -49,11 +55,17 @@ final class TranscriptionService {
     private func transcribePending(onSegment: @escaping (TranscriptSegment) -> Void) async {
         for channel in [AudioChannel.mic, .system] {
             // Keep 1 s of overlap to avoid cutting words at window edges.
-            let audio = await buffers.drain(channel, keepLast: Int(sampleRate))
+            let audio = await buffers.drain(channel, keepLast: Int(sampleRate * overlapSeconds))
             guard audio.count > Int(sampleRate) else { continue }   // skip < 1 s
 
+            // `base` is this window's true offset in the channel's audio
+            // stream. Advance elapsed by the *new* audio only — the kept
+            // overlap is re-fed next window, so counting it here would make
+            // timestamps drift ahead of the real timeline and break the
+            // time-overlap mapping diarization does later.
             let base = elapsed[channel] ?? 0
-            elapsed[channel] = base + Double(audio.count) / sampleRate
+            let kept = min(audio.count, Int(sampleRate * overlapSeconds))
+            elapsed[channel] = base + Double(audio.count - kept) / sampleRate
 
             guard let whisper else { continue }
             do {
@@ -62,6 +74,10 @@ final class TranscriptionService {
                     for seg in r.segments {
                         let text = seg.text.cleanedTranscript
                         guard !text.isEmpty else { continue }
+                        // The first `overlapSeconds` of every window after the
+                        // first was already transcribed last window; emitting
+                        // it again duplicates phrases at window edges.
+                        if base > 0, Double(seg.end) <= overlapSeconds { continue }
                         let segment = TranscriptSegment(
                             start: base + Double(seg.start),
                             end: base + Double(seg.end),

@@ -16,3 +16,6 @@ derivedData/
 DerivedData/
 *.moved-aside
 *.xcuserstate
+
+# Local app bundle built by scripts/bundle.sh
+MeetingNotes.app/
