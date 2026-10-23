@@ -15,7 +15,7 @@ final class SummarizationService {
     private let modelID = "mlx-community/Qwen2.5-3B-Instruct-4bit"
     private var container: ModelContainer?
 
-    private func prepare() async throws -> ModelContainer {
+    func prepare() async throws -> ModelContainer {
         if let container { return container }
         // Use the HuggingFace convenience macro to load the model container.
         let c = try await #huggingFaceLoadModelContainer(

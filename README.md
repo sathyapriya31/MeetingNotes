@@ -33,9 +33,8 @@ WhisperKit require Apple Silicon.)
 
 | Package | URL | Purpose |
 |---|---|---|
-| WhisperKit | https://github.com/argmaxinc/WhisperKit | On-device ASR (Core ML/ANE) |
-| FluidAudio | https://github.com/FluidInference/FluidAudio | VAD + speaker diarization |
-| mlx-swift-examples (MLXLLM/MLXLMCommon) | https://github.com/ml-explore/mlx-swift-examples | Local LLM inference |
+| Voz & Who (desert-ant-core) | https://github.com/Desert-Ant-Labs/desert-ant-core | On-device speech recognition & speaker diarization |
+| mlx-swift-lm (MLXLLM/MLXLMCommon) | https://github.com/ml-explore/mlx-swift-lm | Local LLM inference |
 
 > APIs in FluidAudio and MLXLLM move quickly — pin exact versions and check
 > the call sites marked `// CHECK-API` against the current release.

@@ -33,6 +33,72 @@ final class MeetingStore: ObservableObject {
         meetings.insert(meeting, at: 0)
     }
 
+    func update(_ meeting: Meeting) {
+        guard let index = meetings.firstIndex(where: { $0.id == meeting.id }) else { return }
+        meetings[index] = meeting
+        do {
+            let data = try JSONEncoder().encode(meeting)
+            try data.write(to: fileURL(for: meeting), options: .atomic)
+        } catch {
+            NSLog("MeetingStore: failed to update meeting \(meeting.id): \(error)")
+        }
+    }
+
+    func renameSpeaker(in meetingID: UUID, from oldName: String, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
+        var meeting = meetings[index]
+        meeting.transcript = meeting.transcript.map { seg in
+            if seg.speaker == oldName {
+                var s = seg
+                s.speaker = trimmed
+                return s
+            }
+            return seg
+        }
+
+        // Also update any action items owned by oldName
+        if var notes = meeting.notes {
+            notes.actionItems = notes.actionItems.map { item in
+                if item.owner == oldName {
+                    var updated = item
+                    updated.owner = trimmed
+                    return updated
+                }
+                return item
+            }
+            meeting.notes = notes
+        }
+
+        update(meeting)
+    }
+
+    func renameTitle(in meetingID: UUID, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
+        var meeting = meetings[index]
+        meeting.title = trimmed
+        update(meeting)
+    }
+
+    func toggleActionItem(in meetingID: UUID, itemID: UUID) {
+        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
+        var meeting = meetings[index]
+        guard var notes = meeting.notes else { return }
+        notes.actionItems = notes.actionItems.map { item in
+            if item.id == itemID {
+                var updated = item
+                updated.isCompleted.toggle()
+                return updated
+            }
+            return item
+        }
+        meeting.notes = notes
+        update(meeting)
+    }
+
     func delete(_ meeting: Meeting) {
         try? FileManager.default.removeItem(at: fileURL(for: meeting))
         meetings.removeAll { $0.id == meeting.id }
