@@ -42,6 +42,7 @@ struct MenuBarView: View {
                     .keyboardShortcut("r", modifiers: [.command])
             }
             Button("Open Meeting Notes") {
+                NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "main")
             }
@@ -66,7 +67,6 @@ struct ContentView: View {
     @State private var isRenamingTitle = false
     @State private var newTitleText = ""
     @State private var copiedAlert = false
-    @State private var liveMeetingTitle = "Business Meetings, Career Visibility & Non-Native Speakers"
 
     private var selectedMeeting: Meeting? {
         guard let id = selectedMeetingID else { return nil }
@@ -81,7 +81,7 @@ struct ContentView: View {
         if let meeting = selectedMeeting {
             return meeting.displayTitle
         }
-        return liveMeetingTitle
+        return coordinator.liveTitle.isEmpty ? "Untitled Meeting" : coordinator.liveTitle
     }
 
     private var filteredPreviousMeetings: [Meeting] {
@@ -166,13 +166,6 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .background(KeyWindowEnforcer())
         .onAppear {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
-            DispatchQueue.main.async {
-                for window in NSApp.windows where window.canBecomeKey {
-                    window.makeKeyAndOrderFront(nil)
-                }
-            }
             if selectedMeetingID == nil, let first = store.meetings.first {
                 selectedMeetingID = first.id
             }
@@ -283,7 +276,6 @@ struct ContentView: View {
                     .shadow(color: Theme.primaryBlue.opacity(0.35), radius: 6, y: 2)
                 }
                 .buttonStyle(.plain)
-                .keyboardShortcut("n", modifiers: [.option])
                 .padding(.horizontal, 12)
                 .padding(.top, 12)
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -467,7 +459,7 @@ struct ContentView: View {
 
                 // Stop button
                 Button {
-                    Task { await coordinator.stopMeeting(customTitle: liveMeetingTitle) }
+                    Task { await coordinator.stopMeeting() }
                 } label: {
                     Image(systemName: "stop.fill")
                         .font(.system(size: 11, weight: .bold))
@@ -479,7 +471,6 @@ struct ContentView: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .keyboardShortcut("n", modifiers: [.option])
                 .disabled(!coordinator.isRecording)
             }
         }
@@ -526,7 +517,7 @@ struct ContentView: View {
                     .lineLimit(1)
 
                 Button {
-                    newTitleText = currentTitle
+                    newTitleText = selectedMeeting == nil ? coordinator.liveTitle : currentTitle
                     isRenamingTitle = true
                 } label: {
                     Image(systemName: "pencil")
@@ -549,7 +540,7 @@ struct ContentView: View {
                                 if let meeting = selectedMeeting {
                                     store.renameTitle(in: meeting.id, to: newTitleText)
                                 } else {
-                                    liveMeetingTitle = newTitleText
+                                    coordinator.liveTitle = newTitleText
                                 }
                                 isRenamingTitle = false
                             }
@@ -1228,6 +1219,10 @@ struct TranscriptBubble: View {
 
 // MARK: - Key Window & Activation Enforcer
 
+/// The app is an `LSUIElement` (menu-bar) app, whose windows can't take
+/// keyboard focus — so text fields like search don't work. While the main
+/// window is open, promote the app to a regular (Dock) app and make the window
+/// key; when it closes, drop back to menu-bar-only.
 struct KeyWindowEnforcer: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         EnforcingView()
@@ -1236,23 +1231,26 @@ struct KeyWindowEnforcer: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 
     private class EnforcingView: NSView {
+        private var closeObserver: NSObjectProtocol?
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            if let closeObserver {
+                NotificationCenter.default.removeObserver(closeObserver)
+                self.closeObserver = nil
+            }
             guard let window else { return }
+
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { _ in
+                NSApp.setActivationPolicy(.accessory)
+            }
             DispatchQueue.main.async {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 window.makeKeyAndOrderFront(nil)
             }
-        }
-
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            if let window, !window.isKeyWindow {
-                NSApp.setActivationPolicy(.regular)
-                NSApp.activate(ignoringOtherApps: true)
-                window.makeKeyAndOrderFront(nil)
-            }
-            return super.hitTest(point)
         }
     }
 }

@@ -33,6 +33,25 @@ struct MeetingNotesApp: App {
                 .environmentObject(coordinator.store)
         }
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandMenu("Recording") {
+                // A menu key equivalent works whenever the app is active, unlike a
+                // view-level .keyboardShortcut that needs its window to be key.
+                Button(coordinator.isRecording ? "Stop & Summarize" : "Start Recording") {
+                    Task {
+                        if coordinator.isRecording {
+                            await coordinator.stopMeeting()
+                        } else {
+                            await coordinator.startMeeting()
+                        }
+                    }
+                }
+                .keyboardShortcut("n", modifiers: [.option])
+
+                Button(coordinator.isPaused ? "Resume" : "Pause") { coordinator.togglePause() }
+                    .disabled(!coordinator.isRecording)
+            }
+        }
     }
 }
 
@@ -47,6 +66,8 @@ final class MeetingCoordinator: ObservableObject {
     @Published var currentNotes: MeetingNotes?
     @Published var status: String = "Idle"
     @Published var lastSavedMeetingID: UUID?
+    /// Title typed for the meeting in progress; empty = derive one from the summary.
+    @Published var liveTitle = ""
 
     let store = MeetingStore()
     private var meetingStart: Date?
@@ -57,6 +78,7 @@ final class MeetingCoordinator: ObservableObject {
     private let transcriber = TranscriptionService()
     private let diarizer = DiarizationService()
     private let summarizer = SummarizationService()
+    private let vad = VoiceActivityDetector()
 
     // Raw 16 kHz mono buffers kept for post-meeting diarization.
     private var micSamples: [Float] = []
@@ -92,9 +114,13 @@ final class MeetingCoordinator: ObservableObject {
             meetingStart = Date()
             micSamples.removeAll(); systemSamples.removeAll()
             liveTranscript.removeAll(); currentNotes = nil
+            liveTitle = ""
+            vad.reset()
 
-            isSummarizingLive = false
+            liveSummaryTask?.cancel()
+            liveSummaryTask = nil
             lastLiveSummarizedCount = 0
+            lastLiveSummaryAt = .distantPast
             timerTask?.cancel()
             timerTask = Task { @MainActor [weak self] in
                 while let self = self, self.isRecording {
@@ -102,6 +128,14 @@ final class MeetingCoordinator: ObservableObject {
                     if !self.isPaused {
                         self.recordingDuration += 1
                     }
+                }
+            }
+
+            transcriber.start { [weak self] segment in
+                Task { @MainActor in
+                    guard let self, self.isRecording else { return }
+                    self.liveTranscript.append(segment)
+                    self.triggerLiveSummarization()
                 }
             }
 
@@ -123,42 +157,51 @@ final class MeetingCoordinator: ObservableObject {
             isRecording = false
             timerTask?.cancel()
             timerTask = nil
+            // The mic may already be running if the system tap failed.
+            mic.stop(); systemTap.stop()
+            _ = await transcriber.finish()
         }
     }
 
-    private var isSummarizingLive = false
+    private var liveSummaryTask: Task<Void, Never>?
     private var lastLiveSummarizedCount = 0
+    private var lastLiveSummaryAt = Date.distantPast
+    /// Live summaries rerun the LLM over the whole transcript, so keep them sparse.
+    private let liveSummaryMinInterval: TimeInterval = 45
+    private let liveSummaryMinNewSegments = 4
 
     private func ingest(_ samples: [Float], channel: AudioChannel) {
         guard !isPaused else { return }
         switch channel {
-        case .mic: micSamples.append(contentsOf: samples)
-        case .system: systemSamples.append(contentsOf: samples)
-        }
-        transcriber.feed(samples, channel: channel) { [weak self] segment in
-            Task { @MainActor in
-                guard let self = self else { return }
-                self.liveTranscript.append(segment)
-                self.triggerLiveSummarization()
-            }
+        case .mic:
+            micSamples.append(contentsOf: samples)
+            // Mic frames that are only speaker bleed-through are replaced with
+            // silence (not dropped) so the mic timeline stays aligned.
+            let speaking = vad.isUserSpeaking(micSamples: samples)
+            transcriber.feed(speaking ? samples : [Float](repeating: 0, count: samples.count), channel: .mic)
+        case .system:
+            systemSamples.append(contentsOf: samples)
+            vad.feedSystem(samples)
+            transcriber.feed(samples, channel: .system)
         }
     }
 
     private func triggerLiveSummarization() {
-        guard isRecording, !isSummarizingLive else { return }
+        guard isRecording, liveSummaryTask == nil else { return }
         let count = liveTranscript.count
-        guard count >= 2, (count - lastLiveSummarizedCount) >= 2 else { return }
-        isSummarizingLive = true
+        guard count - lastLiveSummarizedCount >= liveSummaryMinNewSegments,
+              Date().timeIntervalSince(lastLiveSummaryAt) >= liveSummaryMinInterval else { return }
+        lastLiveSummaryAt = Date()
         let snapshot = liveTranscript
 
-        Task { [weak self, summarizer] in
+        liveSummaryTask = Task { [weak self, summarizer] in
             let notes = try? await summarizer.summarize(transcript: snapshot)
-            guard let self = self else { return }
-            self.isSummarizingLive = false
-            if let notes = notes {
-                self.currentNotes = notes
-                self.lastLiveSummarizedCount = count
-            }
+            guard let self else { return }
+            self.liveSummaryTask = nil
+            // A result arriving after Stop is stale — the final summary owns currentNotes.
+            guard !Task.isCancelled, self.isRecording, let notes else { return }
+            self.currentNotes = notes
+            self.lastLiveSummarizedCount = count
         }
     }
 
@@ -169,11 +212,12 @@ final class MeetingCoordinator: ObservableObject {
         mic.stop(); systemTap.stop()
         isRecording = false
         isPaused = false
-        isSummarizingLive = false
+        liveSummaryTask?.cancel()
+        liveSummaryTask = nil
 
         status = "Finalizing transcript…"
         let finalSegments = await transcriber.finish()
-        liveTranscript = finalSegments.sorted { $0.start < $1.start }
+        liveTranscript = TranscriptDeduplicator.deduplicate(finalSegments.sorted { $0.start < $1.start })
 
         status = "Identifying speakers (Who)…"
         let diarized = await diarizer.diarize(
@@ -196,8 +240,9 @@ final class MeetingCoordinator: ObservableObject {
         // let the UI switch to the saved copy.
         if !liveTranscript.isEmpty {
             var meeting = Meeting(date: meetingStart ?? Date(), transcript: liveTranscript, notes: currentNotes)
-            if let customTitle = customTitle?.trimmingCharacters(in: .whitespaces), !customTitle.isEmpty {
-                meeting.title = customTitle
+            let title = (customTitle ?? liveTitle).trimmingCharacters(in: .whitespaces)
+            if !title.isEmpty {
+                meeting.title = title
             }
             store.save(meeting)
             liveTranscript = []

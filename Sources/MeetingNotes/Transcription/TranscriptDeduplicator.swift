@@ -11,6 +11,9 @@ import Foundation
 /// 2. Compute normalised Levenshtein similarity between the two texts.
 /// 3. If similarity ≥ 70 %, drop the mic copy — the system channel is the
 ///    authoritative source for remote voices.
+/// 4. Because each channel is cut into its own 3 s windows, a bleed segment
+///    often straddles two system segments. So also drop a mic segment when
+///    ≥ 60 % of its words appear in the system text spoken within ±3 s.
 enum TranscriptDeduplicator {
 
     /// Maximum time gap (seconds) between segment midpoints for two segments
@@ -19,6 +22,12 @@ enum TranscriptDeduplicator {
 
     /// Minimum text similarity (0.0–1.0) to classify as a duplicate.
     private static let similarityThreshold: Double = 0.70
+
+    /// Seconds of system speech around a mic segment searched for its words.
+    private static let containmentWindowSeconds: Double = 3.0
+
+    /// Fraction of a mic segment's words that must appear in nearby system speech.
+    private static let containmentThreshold: Double = 0.60
 
     /// Remove mic-channel segments that duplicate system-channel segments.
     ///
@@ -34,6 +43,18 @@ enum TranscriptDeduplicator {
             let micMid = (seg.start + seg.end) / 2
             let micText = seg.text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             guard !micText.isEmpty else { continue }
+
+            let nearbyWords = Set(systemSegments
+                .filter { $0.end >= seg.start - containmentWindowSeconds && $0.start <= seg.end + containmentWindowSeconds }
+                .flatMap { words($0.text) })
+            let micWords = words(seg.text)
+            if micWords.count >= 2 {
+                let contained = micWords.filter { nearbyWords.contains($0) }.count
+                if Double(contained) / Double(micWords.count) >= containmentThreshold {
+                    dropIDs.insert(seg.id)
+                    continue
+                }
+            }
 
             for sys in systemSegments {
                 let sysMid = (sys.start + sys.end) / 2
@@ -54,6 +75,14 @@ enum TranscriptDeduplicator {
     }
 
     // MARK: - Text Similarity
+
+    /// Lowercased words with surrounding punctuation stripped.
+    private static func words(_ text: String) -> [String] {
+        text.lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
+            .filter { !$0.isEmpty }
+    }
 
     /// Normalised similarity between two strings: `1 - (editDistance / maxLength)`.
     /// Returns 1.0 for identical strings, 0.0 for completely different ones.
