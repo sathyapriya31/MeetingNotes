@@ -61,6 +61,7 @@ struct ContentView: View {
 
     @State private var selectedMeetingID: UUID?
     @State private var searchText: String = ""
+    @FocusState private var isSearchFocused: Bool
     @State private var selectedSpeakerFilter: String? = nil
     @State private var isRenamingTitle = false
     @State private var newTitleText = ""
@@ -84,14 +85,46 @@ struct ContentView: View {
     }
 
     private var filteredPreviousMeetings: [Meeting] {
-        if searchText.trimmingCharacters(in: .whitespaces).isEmpty {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
             return store.meetings
         }
-        let q = searchText.lowercased()
+        let q = trimmed.lowercased()
         return store.meetings.filter { meeting in
-            meeting.displayTitle.lowercased().contains(q) ||
-            (meeting.notes?.summary.lowercased().contains(q) ?? false) ||
-            meeting.transcript.contains(where: { $0.text.lowercased().contains(q) })
+            // 1. Title & Display Title
+            if meeting.displayTitle.lowercased().contains(q) { return true }
+            if let title = meeting.title, title.lowercased().contains(q) { return true }
+
+            // 2. Date & Time (formatted variations)
+            let dateCard = (meeting.date.formatted(.dateTime.day().month(.abbreviated).year()) + " at " + meeting.date.formatted(.dateTime.hour().minute())).lowercased()
+            let dateAbbr = meeting.date.formatted(date: .abbreviated, time: .shortened).lowercased()
+            let dateLong = meeting.date.formatted(date: .long, time: .shortened).lowercased()
+            let dateNumeric = meeting.date.formatted(date: .numeric, time: .shortened).lowercased()
+            if dateCard.contains(q) || dateAbbr.contains(q) || dateLong.contains(q) || dateNumeric.contains(q) {
+                return true
+            }
+
+            // 3. Speakers (names, initials, or count phrase)
+            if meeting.uniqueSpeakers.contains(where: { $0.lowercased().contains(q) }) { return true }
+            if "\(meeting.uniqueSpeakers.count) speakers".contains(q) || "\(meeting.uniqueSpeakers.count) speaker".contains(q) { return true }
+
+            // 4. Notes: Summary, Key Decisions, Action Items (task & owner)
+            if let notes = meeting.notes {
+                if notes.summary.lowercased().contains(q) { return true }
+                if notes.keyDecisions.contains(where: { $0.lowercased().contains(q) }) { return true }
+                if notes.actionItems.contains(where: {
+                    $0.task.lowercased().contains(q) || $0.owner.lowercased().contains(q)
+                }) {
+                    return true
+                }
+            }
+
+            // 5. Transcript text & segment speakers
+            if meeting.transcript.contains(where: { $0.text.lowercased().contains(q) || $0.speaker.lowercased().contains(q) }) {
+                return true
+            }
+
+            return false
         }
     }
 
@@ -131,7 +164,15 @@ struct ContentView: View {
         }
         .frame(minWidth: 1060, minHeight: 680)
         .preferredColorScheme(.dark)
+        .background(KeyWindowEnforcer())
         .onAppear {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            DispatchQueue.main.async {
+                for window in NSApp.windows where window.canBecomeKey {
+                    window.makeKeyAndOrderFront(nil)
+                }
+            }
             if selectedMeetingID == nil, let first = store.meetings.first {
                 selectedMeetingID = first.id
             }
@@ -206,52 +247,53 @@ struct ContentView: View {
 
     private var sidebarPane: some View {
         VStack(spacing: 12) {
-            // New Recording Button
-            Button {
-                if coordinator.isRecording {
-                    Task { await coordinator.stopMeeting(customTitle: liveMeetingTitle) }
-                } else {
+            if !coordinator.isRecording {
+                // New Recording Button (displayed when NOT recording)
+                Button {
                     selectedMeetingID = nil
                     Task { await coordinator.startMeeting() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("New Recording")
+                            .font(.system(size: 13, weight: .semibold))
+                        Spacer()
+                        Text("⌥N")
+                            .font(.system(size: 11, weight: .medium))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 4))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 14)
+                    .frame(height: 38)
+                    .background(
+                        LinearGradient(
+                            colors: [Theme.primaryBlue, Color(red: 0.16, green: 0.38, blue: 0.88)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        in: RoundedRectangle(cornerRadius: 10)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
+                    )
+                    .shadow(color: Theme.primaryBlue.opacity(0.35), radius: 6, y: 2)
                 }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: coordinator.isRecording ? "stop.fill" : "mic.fill")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(coordinator.isRecording ? "Stop Recording" : "New Recording")
-                        .font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Text("⌥N")
-                        .font(.system(size: 11, weight: .medium))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 4))
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 14)
-                .frame(height: 38)
-                .background(
-                    LinearGradient(
-                        colors: [Theme.primaryBlue, Color(red: 0.16, green: 0.38, blue: 0.88)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ),
-                    in: RoundedRectangle(cornerRadius: 10)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                )
-                .shadow(color: Theme.primaryBlue.opacity(0.35), radius: 6, y: 2)
-            }
-            .buttonStyle(.plain)
-            .keyboardShortcut("n", modifiers: [.option])
-            .padding(.horizontal, 12)
-            .padding(.top, 12)
-
-            // Live "CURRENT MEETING" Card
-            currentMeetingCard
+                .buttonStyle(.plain)
+                .keyboardShortcut("n", modifiers: [.option])
                 .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            } else {
+                // Live "CURRENT MEETING" Card (displayed ONLY when recording starts)
+                currentMeetingCard
+                    .padding(.horizontal, 12)
+                    .padding(.top, 12)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
 
             // PREVIOUS MEETINGS Header & Search
             VStack(spacing: 8) {
@@ -260,12 +302,13 @@ struct ContentView: View {
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(.white.opacity(0.45))
                     Spacer()
-                    Text("\(store.meetings.count) recorded")
+                    let isFiltering = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    Text(isFiltering ? "\(filteredPreviousMeetings.count) found" : "\(store.meetings.count) recorded")
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.5))
+                        .foregroundStyle(isFiltering ? Theme.cyanWave : .white.opacity(0.5))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color.white.opacity(0.06), in: Capsule())
+                        .background(isFiltering ? Theme.cyanWave.opacity(0.12) : Color.white.opacity(0.06), in: Capsule())
                 }
                 .padding(.horizontal, 12)
 
@@ -273,11 +316,12 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 11))
-                        .foregroundStyle(.white.opacity(0.4))
+                        .foregroundStyle(isSearchFocused ? Theme.cyanWave : .white.opacity(0.4))
                     TextField("Filter meetings...", text: $searchText)
                         .font(.system(size: 12))
                         .textFieldStyle(.plain)
                         .foregroundStyle(.white)
+                        .focused($isSearchFocused)
                     if !searchText.isEmpty {
                         Button {
                             searchText = ""
@@ -294,7 +338,7 @@ struct ContentView: View {
                 .background(Theme.bgSurface, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .stroke(Theme.borderSubtle, lineWidth: 1)
+                        .stroke(isSearchFocused ? Theme.borderActive.opacity(0.8) : Theme.borderSubtle, lineWidth: 1)
                 )
                 .padding(.horizontal, 12)
             }
@@ -303,10 +347,20 @@ struct ContentView: View {
             ScrollView(showsIndicators: false) {
                 LazyVStack(spacing: 8) {
                     if filteredPreviousMeetings.isEmpty {
-                        Text(store.meetings.isEmpty ? "No meetings yet" : "No matches found")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.white.opacity(0.4))
-                            .padding(.top, 24)
+                        VStack(spacing: 8) {
+                            Text(store.meetings.isEmpty ? "No meetings yet" : "No matches found")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.4))
+                            if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Button("Clear filter") {
+                                    searchText = ""
+                                }
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(Theme.primaryBlue)
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.top, 24)
                     } else {
                         ForEach(filteredPreviousMeetings) { meeting in
                             MeetingCardView(
@@ -355,6 +409,7 @@ struct ContentView: View {
                 Divider().background(Theme.borderSubtle)
             }
         }
+        .animation(.easeInOut(duration: 0.25), value: coordinator.isRecording)
     }
 
     // MARK: - Current Meeting Card
@@ -424,6 +479,7 @@ struct ContentView: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .keyboardShortcut("n", modifiers: [.option])
                 .disabled(!coordinator.isRecording)
             }
         }
@@ -653,10 +709,11 @@ struct ContentView: View {
 
             // Insights Content
             ScrollView(showsIndicators: false) {
-                VStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 14) {
                     executiveSummaryCard(notes: notes)
                     actionItemsCard(notes: notes)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 14)
             }
@@ -722,16 +779,17 @@ struct ContentView: View {
                 if let decisions = notes?.keyDecisions, !decisions.isEmpty {
                     VStack(alignment: .leading, spacing: 7) {
                         ForEach(decisions, id: \.self) { decision in
-                            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                            HStack(alignment: .top, spacing: 8) {
                                 Circle()
                                     .fill(Theme.cyanWave)
                                     .frame(width: 4, height: 4)
-                                    .padding(.top, 4)
+                                    .padding(.top, 6)
                                 Text(decision)
                                     .font(.system(size: 12))
-                                    .lineSpacing(3)
+                                    .lineSpacing(3.5)
                                     .foregroundStyle(.white.opacity(0.8))
                                     .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                     }
@@ -761,6 +819,7 @@ struct ContentView: View {
                     .padding(.vertical, 4)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(Theme.bgCard, in: RoundedRectangle(cornerRadius: 12))
         .overlay(
@@ -774,62 +833,37 @@ struct ContentView: View {
     private func actionItemsCard(notes: MeetingNotes?) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             // Card Header
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark.square")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(Theme.greenLocal)
-                Text("ACTION ITEMS & NEXT STEPS")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.85))
+            HStack {
+                HStack(spacing: 6) {
+                    Image(systemName: "list.bullet")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.greenLocal)
+                    Text("ACTION ITEMS & NEXT STEPS")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+
+                Spacer()
             }
 
             if let items = notes?.actionItems, !items.isEmpty {
-                VStack(spacing: 6) {
+                VStack(alignment: .leading, spacing: 8) {
                     ForEach(items) { item in
-                        HStack(alignment: .top, spacing: 10) {
-                            Button {
-                                if let meetingID = selectedMeetingID {
-                                    store.toggleActionItem(in: meetingID, itemID: item.id)
-                                }
-                            } label: {
-                                Image(systemName: item.isCompleted ? "checkmark.square.fill" : "square")
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(item.isCompleted ? Theme.primaryBlue : .white.opacity(0.35))
-                                    .padding(.top, 2)
-                            }
-                            .buttonStyle(.plain)
-
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.task)
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(item.isCompleted ? .white.opacity(0.4) : .white.opacity(0.85))
-                                    .strikethrough(item.isCompleted, color: .white.opacity(0.4))
-                                    .lineSpacing(2)
-                                    .textSelection(.enabled)
-
-                                if !item.owner.isEmpty || item.due != nil {
-                                    HStack(spacing: 4) {
-                                        if !item.owner.isEmpty {
-                                            Text(item.owner)
-                                                .font(.system(size: 10, weight: .semibold))
-                                                .foregroundStyle(Theme.primaryBlue.opacity(0.85))
-                                        }
-                                        if let due = item.due {
-                                            Text("• due \(due)")
-                                                .font(.system(size: 10))
-                                                .foregroundStyle(.white.opacity(0.4))
-                                        }
-                                    }
-                                }
-                            }
-
-                            Spacer(minLength: 0)
+                        HStack(alignment: .top, spacing: 8) {
+                            Circle()
+                                .fill(Theme.greenLocal)
+                                .frame(width: 4, height: 4)
+                                .padding(.top, 6)
+                            Text(item.task)
+                                .font(.system(size: 12))
+                                .lineSpacing(3.5)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
                     }
                 }
+                .padding(.top, 2)
             } else if coordinator.isRecording {
                 HStack(spacing: 8) {
                     Image(systemName: "sparkles")
@@ -847,6 +881,7 @@ struct ContentView: View {
                     .padding(.vertical, 4)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(Theme.bgCard, in: RoundedRectangle(cornerRadius: 12))
         .overlay(
@@ -906,13 +941,9 @@ struct ContentView: View {
             md += "\n"
         }
         if !notes.actionItems.isEmpty {
-            md += "## Action Items\n"
+            md += "## Action Items & Next Steps\n"
             for item in notes.actionItems {
-                let status = item.isCompleted ? "[x]" : "[ ]"
-                md += "- \(status) \(item.task)"
-                if !item.owner.isEmpty { md += " (\(item.owner))" }
-                if let due = item.due { md += " due: \(due)" }
-                md += "\n"
+                md += "- \(item.task)\n"
             }
         }
         NSPasteboard.general.clearContents()
@@ -1194,3 +1225,35 @@ struct TranscriptBubble: View {
         return String(format: "%02d:%02d", total / 60, total % 60)
     }
 }
+
+// MARK: - Key Window & Activation Enforcer
+
+struct KeyWindowEnforcer: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        EnforcingView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private class EnforcingView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            DispatchQueue.main.async {
+                NSApp.setActivationPolicy(.regular)
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            if let window, !window.isKeyWindow {
+                NSApp.setActivationPolicy(.regular)
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+            }
+            return super.hitTest(point)
+        }
+    }
+}
+
