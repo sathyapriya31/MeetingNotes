@@ -63,10 +63,21 @@ struct ContentView: View {
     @State private var selectedMeetingID: UUID?
     @State private var searchText: String = ""
     @FocusState private var isSearchFocused: Bool
+    /// Best EmbeddingGemma similarity per meeting for the current `searchText`.
+    @State private var semanticScores: [UUID: Float] = [:]
+
+    /// Minimum cosine similarity for a meeting to show up as a "by meaning" match.
+    /// Raise it if unrelated meetings appear; lower it if obvious matches are missed.
+    private static let semanticThreshold: Float = 0.45
+    private static let maxSemanticResults = 10
     @State private var selectedSpeakerFilter: String? = nil
     @State private var isRenamingTitle = false
     @State private var newTitleText = ""
     @State private var copiedAlert = false
+    @State private var insightsTab: InsightsTab = .insights
+    @State private var askMessages: [AskMessage] = []
+
+    private enum InsightsTab { case insights, ask }
 
     private var selectedMeeting: Meeting? {
         guard let id = selectedMeetingID else { return nil }
@@ -84,13 +95,39 @@ struct ContentView: View {
         return coordinator.liveTitle.isEmpty ? "Untitled Meeting" : coordinator.liveTitle
     }
 
+    /// Keyword matches first (newest first), then meetings that match by meaning
+    /// (EmbeddingGemma), best match first.
     private var filteredPreviousMeetings: [Meeting] {
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             return store.meetings
         }
-        let q = trimmed.lowercased()
-        return store.meetings.filter { meeting in
+        let keywordMatches = keywordFilteredMeetings(trimmed.lowercased())
+        return keywordMatches + semanticOnlyMatches(excluding: Set(keywordMatches.map(\.id)))
+    }
+
+    private func semanticOnlyMatches(excluding ids: Set<UUID>) -> [Meeting] {
+        let scored = store.meetings.compactMap { meeting -> (Meeting, Float)? in
+            guard !ids.contains(meeting.id),
+                  let score = semanticScores[meeting.id],
+                  score >= Self.semanticThreshold else { return nil }
+            return (meeting, score)
+        }
+        return scored
+            .sorted { $0.1 > $1.1 }
+            .prefix(Self.maxSemanticResults)
+            .map(\.0)
+    }
+
+    private var semanticMatchCount: Int {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0 }
+        let keywordIDs = Set(keywordFilteredMeetings(trimmed.lowercased()).map(\.id))
+        return semanticOnlyMatches(excluding: keywordIDs).count
+    }
+
+    private func keywordFilteredMeetings(_ q: String) -> [Meeting] {
+        store.meetings.filter { meeting in
             // 1. Title & Display Title
             if meeting.displayTitle.lowercased().contains(q) { return true }
             if let title = meeting.title, title.lowercased().contains(q) { return true }
@@ -252,11 +289,6 @@ struct ContentView: View {
                         Text("New Recording")
                             .font(.system(size: 13, weight: .semibold))
                         Spacer()
-                        Text("⌥N")
-                            .font(.system(size: 11, weight: .medium))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 4))
                     }
                     .foregroundColor(.white)
                     .padding(.horizontal, 14)
@@ -295,7 +327,10 @@ struct ContentView: View {
                         .foregroundStyle(.white.opacity(0.45))
                     Spacer()
                     let isFiltering = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    Text(isFiltering ? "\(filteredPreviousMeetings.count) found" : "\(store.meetings.count) recorded")
+                    let byMeaning = semanticMatchCount
+                    Text(isFiltering
+                         ? "\(filteredPreviousMeetings.count) found" + (byMeaning > 0 ? " · \(byMeaning) by meaning" : "")
+                         : "\(store.meetings.count) recorded")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(isFiltering ? Theme.cyanWave : .white.opacity(0.5))
                         .padding(.horizontal, 6)
@@ -309,11 +344,23 @@ struct ContentView: View {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 11))
                         .foregroundStyle(isSearchFocused ? Theme.cyanWave : .white.opacity(0.4))
-                    TextField("Filter meetings...", text: $searchText)
+                    TextField("Search meetings or describe a topic…", text: $searchText)
                         .font(.system(size: 12))
                         .textFieldStyle(.plain)
                         .foregroundStyle(.white)
                         .focused($isSearchFocused)
+                        .task(id: searchText) {
+                            semanticScores = [:]
+                            let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            // Very short queries are left to keyword search.
+                            guard query.count >= 3 else { return }
+                            // Debounce: the task is cancelled if the user keeps typing.
+                            try? await Task.sleep(for: .milliseconds(350))
+                            guard !Task.isCancelled else { return }
+                            let scores = (try? await store.semanticSearch.scores(for: query)) ?? [:]
+                            guard !Task.isCancelled else { return }
+                            semanticScores = scores
+                        }
                     if !searchText.isEmpty {
                         Button {
                             searchText = ""
@@ -661,55 +708,74 @@ struct ContentView: View {
 
                 Spacer()
 
-                Button {
-                    copySummary(notes)
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: copiedAlert ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 10))
-                        Text(copiedAlert ? "Copied" : "Copy")
-                            .font(.system(size: 11, weight: .medium))
+                if insightsTab == .insights {
+                    Button {
+                        copySummary(notes)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: copiedAlert ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 10))
+                            Text(copiedAlert ? "Copied" : "Copy")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .foregroundStyle(.white.opacity(0.8))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
                     }
-                    .foregroundStyle(.white.opacity(0.8))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
-                }
-                .buttonStyle(.plain)
+                    .buttonStyle(.plain)
 
-                Button {
-                    copyFullNotes(notes)
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "note.text")
-                            .font(.system(size: 10))
-                            .foregroundStyle(Color.yellow)
-                        Text("Notes")
-                            .font(.system(size: 11, weight: .medium))
+                    Button {
+                        copyFullNotes(notes)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "note.text")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Color.yellow)
+                            Text("Notes")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .foregroundStyle(.white.opacity(0.8))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
                     }
-                    .foregroundStyle(.white.opacity(0.8))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
             .padding(.horizontal, 16)
             .padding(.top, 16)
-            .padding(.bottom, 12)
+            .padding(.bottom, 10)
 
-            // Insights Content
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 14) {
-                    executiveSummaryCard(notes: notes)
-                    actionItemsCard(notes: notes)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14)
-                .padding(.bottom, 14)
+            // Tabs: Insights for the selected meeting | Ask across all meetings
+            HStack(spacing: 6) {
+                insightsTabButton("This Meeting", systemImage: "doc.text", tab: .insights)
+                insightsTabButton("Ask", systemImage: "sparkles", tab: .ask)
+                Spacer()
             }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 10)
 
-            Spacer(minLength: 0)
+            switch insightsTab {
+            case .insights:
+                // Insights Content
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        executiveSummaryCard(notes: notes)
+                        actionItemsCard(notes: notes)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 14)
+                }
+
+                Spacer(minLength: 0)
+            case .ask:
+                AskMeetingsView(messages: $askMessages) { meetingID in
+                    selectedMeetingID = meetingID
+                    selectedSpeakerFilter = nil
+                }
+            }
 
             // Footer: 🟢 Generated locally • 0ms network latency   Synced
             HStack(spacing: 6) {
@@ -734,6 +800,32 @@ struct ContentView: View {
                 Divider().background(Theme.borderSubtle)
             }
         }
+    }
+
+    private func insightsTabButton(_ title: String, systemImage: String, tab: InsightsTab) -> some View {
+        let isActive = insightsTab == tab
+        return Button {
+            insightsTab = tab
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 10, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(isActive ? .white : .white.opacity(0.5))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                isActive ? Theme.primaryBlue.opacity(0.25) : Color.white.opacity(0.04),
+                in: Capsule()
+            )
+            .overlay(
+                Capsule()
+                    .stroke(isActive ? Theme.borderActive.opacity(0.6) : Theme.borderSubtle, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Executive Summary Card

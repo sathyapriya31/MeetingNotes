@@ -76,6 +76,27 @@ final class SummarizationService {
         s.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".…"))).isEmpty
     }
 
+    /// Answers `question` using only the given meeting excerpts (retrieval-augmented).
+    /// Excerpts are numbered so the model can cite them as [1], [2], …
+    func answer(question: String, excerpts: [(source: String, text: String)]) async throws -> String {
+        let container = try await prepare()
+        let context = excerpts.enumerated()
+            .map { "[\($0.offset + 1)] (\($0.element.source))\n\($0.element.text)" }
+            .joined(separator: "\n\n")
+        let prompt = """
+        You answer questions about the user's past meetings. Use ONLY the excerpts below. \
+        If they don't contain the answer, say you couldn't find it in the meetings — do not guess. \
+        Be concise (2-5 sentences or a short list). Cite excerpts you used like [1] or [2][3].
+
+        Excerpts:
+        \(context)
+
+        Question: \(question)
+        """
+        return try await generate(prompt, container: container, maxTokens: 500)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func generate(_ prompt: String, container: ModelContainer, maxTokens: Int) async throws -> String {
         try await container.perform { context in   // CHECK-API
             let input = try await context.processor.prepare(

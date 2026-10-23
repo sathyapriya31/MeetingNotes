@@ -263,6 +263,51 @@ final class MeetingCoordinator: ObservableObject {
             return seg
         }
     }
+
+    // MARK: - Ask your meetings
+
+    /// Answers a question about past meetings: EmbeddingGemma retrieves the most
+    /// relevant excerpts, then the local LLM answers from those excerpts only.
+    func ask(_ question: String) async throws -> MeetingAnswer {
+        let passages = try await store.semanticSearch.topPassages(for: question, limit: 6, minScore: 0.3)
+        let meetingsByID = Dictionary(uniqueKeysWithValues: store.meetings.map { ($0.id, $0) })
+        let usable = passages.filter { meetingsByID[$0.meetingID] != nil }
+
+        guard !usable.isEmpty else {
+            return MeetingAnswer(
+                text: "I couldn't find anything about that in your meetings. "
+                    + "If you just recorded or opened the app, indexing may still be running — try again in a moment.",
+                excerptMeetingIDs: []
+            )
+        }
+
+        let excerpts = usable.map { passage in
+            let meeting = meetingsByID[passage.meetingID]!
+            let source = "\(meeting.displayTitle), \(meeting.date.formatted(date: .abbreviated, time: .omitted))"
+            return (source: source, text: passage.text)
+        }
+        let text = try await summarizer.answer(question: question, excerpts: excerpts)
+        return MeetingAnswer(text: text, excerptMeetingIDs: usable.map(\.meetingID))
+    }
+}
+
+struct MeetingAnswer {
+    let text: String
+    /// Meeting behind each excerpt given to the LLM; index i is citation [i + 1].
+    let excerptMeetingIDs: [UUID]
+
+    /// Citation number and meeting for each source to show, one per meeting.
+    /// Uses the citations the model wrote; falls back to every excerpt if it wrote none.
+    var sources: [(number: Int, meetingID: UUID)] {
+        let cited = text.matches(of: #/\[(\d+)\]/#).compactMap { Int($0.1) }
+        let numbers = cited.isEmpty ? Array(excerptMeetingIDs.indices.map { $0 + 1 }) : cited
+        var seenMeetings = Set<UUID>()
+        return numbers.compactMap { n in
+            guard excerptMeetingIDs.indices.contains(n - 1) else { return nil }
+            let id = excerptMeetingIDs[n - 1]
+            return seenMeetings.insert(id).inserted ? (n, id) : nil
+        }
+    }
 }
 
 enum AudioChannel: String, Codable { case mic, system }

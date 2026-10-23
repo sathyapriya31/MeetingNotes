@@ -6,13 +6,28 @@ import Foundation
 final class MeetingStore: ObservableObject {
     @Published private(set) var meetings: [Meeting] = []
 
+    /// EmbeddingGemma-backed index used for "search by meaning" in the sidebar.
+    let semanticSearch: SemanticSearchService
+
     private let directory: URL
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         directory = base.appendingPathComponent("MeetingNotes/Meetings", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        semanticSearch = SemanticSearchService(
+            directory: base.appendingPathComponent("MeetingNotes", isDirectory: true)
+        )
         load()
+    }
+
+    /// Re-indexes in the background; unchanged meetings are skipped cheaply.
+    private func refreshSemanticIndex() {
+        let snapshot = meetings
+        let search = semanticSearch
+        Task.detached(priority: .utility) {
+            await search.sync(with: snapshot)
+        }
     }
 
     func load() {
@@ -21,6 +36,7 @@ final class MeetingStore: ObservableObject {
             .filter { $0.pathExtension == "json" }
             .compactMap { try? JSONDecoder().decode(Meeting.self, from: Data(contentsOf: $0)) }
             .sorted { $0.date > $1.date }
+        refreshSemanticIndex()
     }
 
     func save(_ meeting: Meeting) {
@@ -31,6 +47,7 @@ final class MeetingStore: ObservableObject {
             NSLog("MeetingStore: failed to save meeting \(meeting.id): \(error)")
         }
         meetings.insert(meeting, at: 0)
+        refreshSemanticIndex()
     }
 
     func update(_ meeting: Meeting) {
@@ -42,6 +59,7 @@ final class MeetingStore: ObservableObject {
         } catch {
             NSLog("MeetingStore: failed to update meeting \(meeting.id): \(error)")
         }
+        refreshSemanticIndex()
     }
 
     func renameSpeaker(in meetingID: UUID, from oldName: String, to newName: String) {
@@ -102,6 +120,7 @@ final class MeetingStore: ObservableObject {
     func delete(_ meeting: Meeting) {
         try? FileManager.default.removeItem(at: fileURL(for: meeting))
         meetings.removeAll { $0.id == meeting.id }
+        refreshSemanticIndex()
     }
 
     private func fileURL(for meeting: Meeting) -> URL {
