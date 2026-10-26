@@ -26,6 +26,11 @@ final class SummarizationService {
     }
 
     func summarize(transcript: [TranscriptSegment]) async throws -> MeetingNotes {
+        // With no transcript the model has nothing to ground on and hallucinates.
+        guard !transcript.isEmpty else {
+            throw NSError(domain: "Summarizer", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Nothing to summarize — the transcript is empty"])
+        }
         let container = try await prepare()
 
         // 1. Chunk transcript into ~10-minute windows.

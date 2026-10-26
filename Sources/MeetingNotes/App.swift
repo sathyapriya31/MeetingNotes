@@ -4,6 +4,8 @@ import AVFoundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let stored = UserDefaults.standard.string(forKey: AppAppearance.appearanceKey)
+        (stored.flatMap(AppAppearance.init(rawValue:)) ?? AppAppearance.defaultValue).apply()
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -37,7 +39,8 @@ struct MeetingNotesApp: App {
             CommandMenu("Recording") {
                 // A menu key equivalent works whenever the app is active, unlike a
                 // view-level .keyboardShortcut that needs its window to be key.
-                Button(coordinator.isRecording ? "Stop & Summarize" : "Start Recording") {
+                Button(coordinator.isRecording ? "Stop & Summarize"
+                       : coordinator.isPreparing ? "Loading Models…" : "Start Recording") {
                     Task {
                         if coordinator.isRecording {
                             await coordinator.stopMeeting()
@@ -47,10 +50,15 @@ struct MeetingNotesApp: App {
                     }
                 }
                 .keyboardShortcut("n", modifiers: [.option])
+                .disabled(coordinator.isPreparing)
 
                 Button(coordinator.isPaused ? "Resume" : "Pause") { coordinator.togglePause() }
                     .disabled(!coordinator.isRecording)
             }
+        }
+
+        Settings {
+            SettingsView()
         }
     }
 }
@@ -68,6 +76,10 @@ final class MeetingCoordinator: ObservableObject {
     @Published var lastSavedMeetingID: UUID?
     /// Title typed for the meeting in progress; empty = derive one from the summary.
     @Published var liveTitle = ""
+    /// True while models load after Start, before capture actually begins.
+    @Published var isPreparing = false
+    /// Why the last start attempt failed (shown in the main window), if it did.
+    @Published var startError: String?
 
     let store = MeetingStore()
     private var meetingStart: Date?
@@ -90,7 +102,10 @@ final class MeetingCoordinator: ObservableObject {
     }
 
     func startMeeting() async {
-        guard !isRecording else { return }
+        guard !isRecording, !isPreparing else { return }
+        isPreparing = true
+        startError = nil
+        defer { isPreparing = false }
 
         // Ask for mic access before touching AVAudioEngine — with access not
         // yet granted the input node reports an invalid HW format and CoreAudio
@@ -99,6 +114,7 @@ final class MeetingCoordinator: ObservableObject {
         let granted = await AVCaptureDevice.requestAccess(for: .audio)
         guard granted else {
             status = "Microphone access denied — enable it in System Settings → Privacy & Security → Microphone."
+            startError = status
             return
         }
 
@@ -154,6 +170,7 @@ final class MeetingCoordinator: ObservableObject {
         } catch {
             print("MeetingCoordinator start error: \(error)")
             status = "Failed to start: \(error.localizedDescription)"
+            startError = status
             isRecording = false
             timerTask?.cancel()
             timerTask = nil
@@ -218,6 +235,14 @@ final class MeetingCoordinator: ObservableObject {
         status = "Finalizing transcript…"
         let finalSegments = await transcriber.finish()
         liveTranscript = TranscriptDeduplicator.deduplicate(finalSegments.sorted { $0.start < $1.start })
+
+        // Nothing was said: don't diarize or summarize (the LLM would invent a
+        // meeting from an empty prompt), and drop any live notes.
+        guard !liveTranscript.isEmpty else {
+            currentNotes = nil
+            status = "No speech captured — nothing was saved."
+            return
+        }
 
         status = "Identifying speakers (Who)…"
         let diarized = await diarizer.diarize(

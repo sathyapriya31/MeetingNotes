@@ -50,7 +50,7 @@ struct AskMeetingsView: View {
                                     .controlSize(.small)
                                 Text("Searching your meetings…")
                                     .font(.system(size: 11.5))
-                                    .foregroundStyle(.white.opacity(0.5))
+                                    .foregroundStyle(Theme.fg.opacity(0.5))
                             }
                             .id("thinking")
                         }
@@ -81,12 +81,12 @@ struct AskMeetingsView: View {
                     .foregroundStyle(Theme.cyanWave)
                 Text("ASK YOUR MEETINGS")
                     .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.85))
+                    .foregroundStyle(Theme.fg.opacity(0.85))
             }
             Text("Ask a question across all your recorded meetings. Answers are generated on-device from the relevant parts of your transcripts.")
                 .font(.system(size: 12))
                 .lineSpacing(3)
-                .foregroundStyle(.white.opacity(0.55))
+                .foregroundStyle(Theme.fg.opacity(0.55))
                 .fixedSize(horizontal: false, vertical: true)
 
             VStack(alignment: .leading, spacing: 6) {
@@ -96,12 +96,12 @@ struct AskMeetingsView: View {
                     } label: {
                         Text(suggestion)
                             .font(.system(size: 11.5))
-                            .foregroundStyle(.white.opacity(0.8))
+                            .foregroundStyle(Theme.fg.opacity(0.8))
                             .multilineTextAlignment(.leading)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                            .background(Theme.fg.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 8)
                                     .stroke(Theme.borderSubtle, lineWidth: 1)
@@ -116,7 +116,7 @@ struct AskMeetingsView: View {
             if store.meetings.isEmpty {
                 Text("Record a meeting first — there's nothing to search yet.")
                     .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.4))
+                    .foregroundStyle(Theme.fg.opacity(0.4))
             }
         }
         .padding(14)
@@ -148,7 +148,7 @@ struct AskMeetingsView: View {
                 Text(message.text)
                     .font(.system(size: 12.5))
                     .lineSpacing(3)
-                    .foregroundStyle(message.role == .error ? Theme.redRecording : .white.opacity(0.85))
+                    .foregroundStyle(message.role == .error ? Theme.redRecording : Theme.fg.opacity(0.85))
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -170,7 +170,7 @@ struct AskMeetingsView: View {
         VStack(alignment: .leading, spacing: 5) {
             Text("SOURCES")
                 .font(.system(size: 9.5, weight: .bold))
-                .foregroundStyle(.white.opacity(0.4))
+                .foregroundStyle(Theme.fg.opacity(0.4))
             ForEach(sources, id: \.number) { source in
                 if let meeting = store.meetings.first(where: { $0.id == source.meetingID }) {
                     Button {
@@ -184,16 +184,16 @@ struct AskMeetingsView: View {
                                 .background(Theme.cyanWave.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
                             Text(meeting.displayTitle)
                                 .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.8))
+                                .foregroundStyle(Theme.fg.opacity(0.8))
                                 .lineLimit(1)
                             Spacer(minLength: 4)
                             Text(meeting.date.formatted(.dateTime.month(.abbreviated).day()))
                                 .font(.system(size: 10))
-                                .foregroundStyle(.white.opacity(0.4))
+                                .foregroundStyle(Theme.fg.opacity(0.4))
                         }
                         .padding(.horizontal, 7)
                         .padding(.vertical, 5)
-                        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+                        .background(Theme.fg.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -210,7 +210,7 @@ struct AskMeetingsView: View {
             TextField("Ask about your meetings…", text: $question, axis: .vertical)
                 .font(.system(size: 12))
                 .textFieldStyle(.plain)
-                .foregroundStyle(.white)
+                .foregroundStyle(Theme.fg)
                 .lineLimit(1...4)
                 .focused($isInputFocused)
                 .onSubmit { submit(question) }
@@ -220,9 +220,9 @@ struct AskMeetingsView: View {
             } label: {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(canSubmit ? Color.white : Theme.fg.opacity(0.4))
                     .frame(width: 24, height: 24)
-                    .background(canSubmit ? Theme.primaryBlue : Color.white.opacity(0.1), in: Circle())
+                    .background(canSubmit ? Theme.primaryBlue : Theme.fg.opacity(0.1), in: Circle())
             }
             .buttonStyle(.plain)
             .disabled(!canSubmit)

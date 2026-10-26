@@ -4,19 +4,95 @@ import AppKit
 // MARK: - Design System & Theme
 
 enum Theme {
-    static let bgApp = Color(red: 0.05, green: 0.07, blue: 0.09)           // #0D1117
-    static let bgSidebar = Color(red: 0.07, green: 0.09, blue: 0.12)       // #121620
-    static let bgSurface = Color(red: 0.09, green: 0.12, blue: 0.16)       // #171D27
-    static let bgCard = Color(red: 0.10, green: 0.13, blue: 0.18)          // #1A202C
-    static let bgCardActive = Color(red: 0.12, green: 0.17, blue: 0.25)    // #1F2C40
-    static let borderSubtle = Color.white.opacity(0.08)
+    // Each colour resolves against the current appearance (see AppAppearance),
+    // so views pick up Light/Dark changes without being rebuilt.
+    static let bgApp = dynamic(dark: (0.05, 0.07, 0.09), light: (0.965, 0.972, 0.980))        // #0D1117 / #F6F8FA
+    static let bgSidebar = dynamic(dark: (0.07, 0.09, 0.12), light: (0.933, 0.945, 0.961))    // #121620 / #EEF1F5
+    static let bgSurface = dynamic(dark: (0.09, 0.12, 0.16), light: (1.0, 1.0, 1.0))          // #171D27 / #FFFFFF
+    static let bgCard = dynamic(dark: (0.10, 0.13, 0.18), light: (1.0, 1.0, 1.0))             // #1A202C / #FFFFFF
+    static let bgCardActive = dynamic(dark: (0.12, 0.17, 0.25), light: (0.906, 0.933, 0.984)) // #1F2C40 / #E7EEFB
+    /// Primary text/icon colour; use `.opacity()` for secondary tints.
+    static let fg = dynamic(dark: (1.0, 1.0, 1.0), light: (0.07, 0.09, 0.13))                 // #FFFFFF / #12171F
+    static let borderSubtle = fg.opacity(0.08)
     static let borderActive = Color(red: 0.25, green: 0.50, blue: 0.95)
 
-    static let primaryBlue = Color(red: 0.22, green: 0.48, blue: 0.96)     // #387BF6
-    static let cyanWave = Color(red: 0.15, green: 0.75, blue: 0.90)        // #26BFE6
-    static let greenLocal = Color(red: 0.18, green: 0.75, blue: 0.48)      // #2EBF7A
-    static let purpleSpeaker = Color(red: 0.68, green: 0.38, blue: 0.88)   // #AE61E0
-    static let redRecording = Color(red: 0.94, green: 0.28, blue: 0.33)    // #F04754
+    static let primaryBlue = Color(red: 0.22, green: 0.48, blue: 0.96)                        // #387BF6
+    static let cyanWave = dynamic(dark: (0.15, 0.75, 0.90), light: (0.03, 0.53, 0.70))        // #26BFE6 / #0887B3
+    static let greenLocal = dynamic(dark: (0.18, 0.75, 0.48), light: (0.09, 0.58, 0.34))      // #2EBF7A / #179457
+    static let purpleSpeaker = Color(red: 0.68, green: 0.38, blue: 0.88)                      // #AE61E0
+    static let redRecording = Color(red: 0.94, green: 0.28, blue: 0.33)                       // #F04754
+
+    private static func dynamic(dark: (CGFloat, CGFloat, CGFloat), light: (CGFloat, CGFloat, CGFloat)) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let c = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: c.0, green: c.1, blue: c.2, alpha: 1)
+        })
+    }
+}
+
+/// User-selectable appearance, persisted under `appearanceKey`.
+enum AppAppearance: String, CaseIterable, Identifiable {
+    case system, light, dark
+
+    static let appearanceKey = "appAppearance"
+    static let defaultValue = AppAppearance.dark
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: return "System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .system: return "circle.lefthalf.filled"
+        case .light: return "sun.max.fill"
+        case .dark: return "moon.fill"
+        }
+    }
+
+    /// Applied app-wide so every window, popover, alert and the menu-bar panel
+    /// follow the choice (`nil` = follow macOS).
+    func apply() {
+        switch self {
+        case .system: NSApp.appearance = nil
+        case .light: NSApp.appearance = NSAppearance(named: .aqua)
+        case .dark: NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
+/// Segmented Light / Dark / System picker bound to the stored appearance.
+struct AppearancePicker: View {
+    @AppStorage(AppAppearance.appearanceKey) private var appearance = AppAppearance.defaultValue
+
+    var body: some View {
+        Picker("Appearance", selection: $appearance) {
+            ForEach(AppAppearance.allCases) { option in
+                Label(option.title, systemImage: option.symbol).tag(option)
+            }
+        }
+        .onChange(of: appearance) { appearance.apply() }
+    }
+}
+
+struct SettingsView: View {
+    var body: some View {
+        Form {
+            AppearancePicker()
+                .pickerStyle(.segmented)
+            Text("System follows the macOS appearance setting.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .formStyle(.grouped)
+        .frame(width: 380)
+        .fixedSize()
+    }
 }
 
 // MARK: - MenuBar View
@@ -28,9 +104,14 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Circle()
-                    .fill(coordinator.isRecording ? Theme.redRecording : .secondary)
-                    .frame(width: 8, height: 8)
+                if coordinator.isPreparing {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Circle()
+                        .fill(coordinator.isRecording ? Theme.redRecording : .secondary)
+                        .frame(width: 8, height: 8)
+                }
                 Text(coordinator.status)
                     .font(.system(size: 13, weight: .medium))
             }
@@ -40,12 +121,17 @@ struct MenuBarView: View {
             } else {
                 Button("Start Meeting Capture") { Task { await coordinator.startMeeting() } }
                     .keyboardShortcut("r", modifiers: [.command])
+                    .disabled(coordinator.isPreparing)
             }
             Button("Open Meeting Notes") {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "main")
             }
+            SettingsLink {
+                Text("Settings…")
+            }
+            .keyboardShortcut(",", modifiers: [.command])
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
         }
@@ -61,6 +147,7 @@ struct ContentView: View {
     @EnvironmentObject var store: MeetingStore
 
     @State private var selectedMeetingID: UUID?
+    @AppStorage(AppAppearance.appearanceKey) private var appearance = AppAppearance.defaultValue
     @State private var searchText: String = ""
     @FocusState private var isSearchFocused: Bool
     /// Best EmbeddingGemma similarity per meeting for the current `searchText`.
@@ -74,6 +161,7 @@ struct ContentView: View {
     @State private var isRenamingTitle = false
     @State private var newTitleText = ""
     @State private var copiedAlert = false
+    @State private var showClearAllAlert = false
     @State private var insightsTab: InsightsTab = .insights
     @State private var askMessages: [AskMessage] = []
 
@@ -200,11 +288,17 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 1060, minHeight: 680)
-        .preferredColorScheme(.dark)
         .background(KeyWindowEnforcer())
         .onAppear {
             if selectedMeetingID == nil, let first = store.meetings.first {
                 selectedMeetingID = first.id
+            }
+        }
+        .onChange(of: coordinator.isPreparing) {
+            // Started from the menu bar / ⌥N: switch to the live view so the
+            // loading state is visible.
+            if coordinator.isPreparing {
+                selectedMeetingID = nil
             }
         }
         .onChange(of: coordinator.isRecording) {
@@ -216,6 +310,15 @@ struct ContentView: View {
             if let id = coordinator.lastSavedMeetingID {
                 selectedMeetingID = id
             }
+        }
+        .alert("Clear All Meetings?", isPresented: $showClearAllAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Clear All", role: .destructive) {
+                store.deleteAll()
+                selectedMeetingID = nil
+            }
+        } message: {
+            Text("Are you sure you want to delete all recorded meetings? This action cannot be undone.")
         }
     }
 
@@ -235,18 +338,33 @@ struct ContentView: View {
 
                 Text("Meeting Notes")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Theme.fg)
 
                 Text("/")
                     .font(.system(size: 13))
-                    .foregroundStyle(.white.opacity(0.3))
+                    .foregroundStyle(Theme.fg.opacity(0.3))
 
                 Text(Date().formatted(.dateTime.month(.abbreviated).day().year()))
                     .font(.system(size: 13))
-                    .foregroundStyle(.white.opacity(0.6))
+                    .foregroundStyle(Theme.fg.opacity(0.6))
             }
 
             Spacer()
+
+            // Appearance switcher (also in Settings, ⌘,)
+            Menu {
+                AppearancePicker()
+                    .pickerStyle(.inline)
+            } label: {
+                Image(systemName: appearance.symbol)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.fg.opacity(0.75))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Appearance: \(appearance.title)")
+            .padding(.trailing, 10)
 
             // Right Badge: 🟢 On-Device AI • Apple Silicon Neural Engine
             HStack(spacing: 7) {
@@ -257,17 +375,17 @@ struct ContentView: View {
 
                 Text("On-Device AI • Apple Silicon Neural Engine")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.9))
+                    .foregroundStyle(Theme.fg.opacity(0.9))
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(
                 Capsule()
-                    .fill(Color.white.opacity(0.05))
+                    .fill(Theme.fg.opacity(0.05))
             )
             .overlay(
                 Capsule()
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    .stroke(Theme.fg.opacity(0.12), lineWidth: 1)
             )
             .padding(.trailing, 16)
         }
@@ -284,9 +402,15 @@ struct ContentView: View {
                     Task { await coordinator.startMeeting() }
                 } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: "mic.fill")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text("New Recording")
+                        if coordinator.isPreparing {
+                            ProgressView()
+                                .controlSize(.small)
+                                .colorScheme(.dark)   // light spinner on the blue button
+                        } else {
+                            Image(systemName: "mic.fill")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        Text(coordinator.isPreparing ? "Preparing…" : "New Recording")
                             .font(.system(size: 13, weight: .semibold))
                         Spacer()
                     }
@@ -306,8 +430,10 @@ struct ContentView: View {
                             .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
                     )
                     .shadow(color: Theme.primaryBlue.opacity(0.35), radius: 6, y: 2)
+                    .opacity(coordinator.isPreparing ? 0.8 : 1)
                 }
                 .buttonStyle(.plain)
+                .disabled(coordinator.isPreparing)
                 .padding(.horizontal, 12)
                 .padding(.top, 12)
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -321,21 +447,29 @@ struct ContentView: View {
 
             // PREVIOUS MEETINGS Header & Search
             VStack(spacing: 8) {
-                HStack {
+                HStack(spacing: 8) {
                     Text("PREVIOUS MEETINGS")
                         .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.45))
+                        .foregroundStyle(Theme.fg.opacity(0.45))
                     Spacer()
+                    if !store.meetings.isEmpty {
+                        Button("Clear All") {
+                            showClearAllAlert = true
+                        }
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Color.red.opacity(0.75))
+                        .buttonStyle(.plain)
+                    }
                     let isFiltering = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     let byMeaning = semanticMatchCount
                     Text(isFiltering
                          ? "\(filteredPreviousMeetings.count) found" + (byMeaning > 0 ? " · \(byMeaning) by meaning" : "")
                          : "\(store.meetings.count) recorded")
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(isFiltering ? Theme.cyanWave : .white.opacity(0.5))
+                        .foregroundStyle(isFiltering ? Theme.cyanWave : Theme.fg.opacity(0.5))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(isFiltering ? Theme.cyanWave.opacity(0.12) : Color.white.opacity(0.06), in: Capsule())
+                        .background(isFiltering ? Theme.cyanWave.opacity(0.12) : Theme.fg.opacity(0.06), in: Capsule())
                 }
                 .padding(.horizontal, 12)
 
@@ -343,11 +477,11 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 11))
-                        .foregroundStyle(isSearchFocused ? Theme.cyanWave : .white.opacity(0.4))
+                        .foregroundStyle(isSearchFocused ? Theme.cyanWave : Theme.fg.opacity(0.4))
                     TextField("Search meetings or describe a topic…", text: $searchText)
                         .font(.system(size: 12))
                         .textFieldStyle(.plain)
-                        .foregroundStyle(.white)
+                        .foregroundStyle(Theme.fg)
                         .focused($isSearchFocused)
                         .task(id: searchText) {
                             semanticScores = [:]
@@ -367,7 +501,7 @@ struct ContentView: View {
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.4))
+                                .foregroundStyle(Theme.fg.opacity(0.4))
                         }
                         .buttonStyle(.plain)
                     }
@@ -389,7 +523,7 @@ struct ContentView: View {
                         VStack(spacing: 8) {
                             Text(store.meetings.isEmpty ? "No meetings yet" : "No matches found")
                                 .font(.system(size: 12))
-                                .foregroundStyle(.white.opacity(0.4))
+                                .foregroundStyle(Theme.fg.opacity(0.4))
                             if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                 Button("Clear filter") {
                                     searchText = ""
@@ -432,14 +566,14 @@ struct ContentView: View {
                     .foregroundStyle(Theme.greenLocal)
                 Text("100% Local Voz & Who")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.75))
+                    .foregroundStyle(Theme.fg.opacity(0.75))
                 Spacer()
                 Text("v2.4")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.45))
+                    .foregroundStyle(Theme.fg.opacity(0.45))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(Color.white.opacity(0.06), in: Capsule())
+                    .background(Theme.fg.opacity(0.06), in: Capsule())
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -458,7 +592,7 @@ struct ContentView: View {
             // Top row
             HStack(spacing: 6) {
                 Circle()
-                    .fill(coordinator.isRecording ? (coordinator.isPaused ? Color.orange : Theme.redRecording) : Color.white.opacity(0.3))
+                    .fill(coordinator.isRecording ? (coordinator.isPaused ? Color.orange : Theme.redRecording) : Theme.fg.opacity(0.3))
                     .frame(width: 8, height: 8)
                     .shadow(color: coordinator.isRecording ? Theme.redRecording.opacity(0.6) : .clear, radius: 3)
 
@@ -470,11 +604,11 @@ struct ContentView: View {
 
                 Text(coordinator.isRecording ? (coordinator.isPaused ? "Paused" : "Recording") : "Idle")
                     .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(coordinator.isRecording ? Theme.redRecording : .white.opacity(0.4))
+                    .foregroundStyle(coordinator.isRecording ? Theme.redRecording : Theme.fg.opacity(0.4))
                     .padding(.horizontal, 7)
                     .padding(.vertical, 2)
                     .background(
-                        coordinator.isRecording ? Theme.redRecording.opacity(0.18) : Color.white.opacity(0.06),
+                        coordinator.isRecording ? Theme.redRecording.opacity(0.18) : Theme.fg.opacity(0.06),
                         in: Capsule()
                     )
             }
@@ -487,7 +621,7 @@ struct ContentView: View {
                 // Timer
                 Text(formatDuration(coordinator.recordingDuration))
                     .font(.system(size: 16, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Theme.fg)
 
                 Spacer()
 
@@ -497,9 +631,9 @@ struct ContentView: View {
                 } label: {
                     Image(systemName: coordinator.isPaused ? "play.fill" : "pause.fill")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.white.opacity(coordinator.isRecording ? 0.9 : 0.3))
+                        .foregroundStyle(Theme.fg.opacity(coordinator.isRecording ? 0.9 : 0.3))
                         .frame(width: 26, height: 26)
-                        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                        .background(Theme.fg.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
                 .disabled(!coordinator.isRecording)
@@ -510,10 +644,10 @@ struct ContentView: View {
                 } label: {
                     Image(systemName: "stop.fill")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(coordinator.isRecording ? Theme.redRecording : .white.opacity(0.3))
+                        .foregroundStyle(coordinator.isRecording ? Theme.redRecording : Theme.fg.opacity(0.3))
                         .frame(width: 26, height: 26)
                         .background(
-                            coordinator.isRecording ? Theme.redRecording.opacity(0.2) : Color.white.opacity(0.06),
+                            coordinator.isRecording ? Theme.redRecording.opacity(0.2) : Theme.fg.opacity(0.06),
                             in: RoundedRectangle(cornerRadius: 6)
                         )
                 }
@@ -560,7 +694,7 @@ struct ContentView: View {
             HStack(spacing: 8) {
                 Text(currentTitle)
                     .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Theme.fg)
                     .lineLimit(1)
 
                 Button {
@@ -569,7 +703,7 @@ struct ContentView: View {
                 } label: {
                     Image(systemName: "pencil")
                         .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.5))
+                        .foregroundStyle(Theme.fg.opacity(0.5))
                         .padding(4)
                 }
                 .buttonStyle(.plain)
@@ -637,7 +771,40 @@ struct ContentView: View {
             }
 
             // Transcript Messages ScrollView
-            if segments.isEmpty {
+            if segments.isEmpty && coordinator.isPreparing {
+                VStack(spacing: 14) {
+                    Spacer()
+                    ProgressView()
+                        .controlSize(.large)
+                    Text(coordinator.status)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Theme.fg.opacity(0.75))
+                    Text("Loading the on-device models. The first recording after launch can take up to a minute — capture starts automatically when they're ready.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.fg.opacity(0.35))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 360)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if segments.isEmpty, !coordinator.isRecording, selectedMeetingID == nil, let error = coordinator.startError {
+                VStack(spacing: 14) {
+                    Spacer()
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 32))
+                        .foregroundStyle(Color.orange)
+                    Text("Couldn't start recording")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Theme.fg.opacity(0.75))
+                    Text(error)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.fg.opacity(0.5))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 380)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if segments.isEmpty {
                 VStack(spacing: 14) {
                     Spacer()
                     if coordinator.isRecording {
@@ -646,14 +813,14 @@ struct ContentView: View {
                     } else {
                         Image(systemName: "waveform")
                             .font(.system(size: 36))
-                            .foregroundStyle(.white.opacity(0.2))
+                            .foregroundStyle(Theme.fg.opacity(0.2))
                     }
                     Text(coordinator.isRecording ? "Listening for speech…" : "No transcript yet")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.75))
+                        .foregroundStyle(Theme.fg.opacity(0.75))
                     Text(coordinator.isRecording ? "Speak into your microphone or play meeting audio. Text appears in real time." : "Click New Recording to capture a live conversation.")
                         .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.35))
+                        .foregroundStyle(Theme.fg.opacity(0.35))
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -704,7 +871,7 @@ struct ContentView: View {
                     .frame(width: 8, height: 8)
                 Text("AI Meeting Insights")
                     .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Theme.fg)
 
                 Spacer()
 
@@ -718,10 +885,10 @@ struct ContentView: View {
                             Text(copiedAlert ? "Copied" : "Copy")
                                 .font(.system(size: 11, weight: .medium))
                         }
-                        .foregroundStyle(.white.opacity(0.8))
+                        .foregroundStyle(Theme.fg.opacity(0.8))
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
+                        .background(Theme.fg.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
                     }
                     .buttonStyle(.plain)
 
@@ -735,10 +902,10 @@ struct ContentView: View {
                             Text("Notes")
                                 .font(.system(size: 11, weight: .medium))
                         }
-                        .foregroundStyle(.white.opacity(0.8))
+                        .foregroundStyle(Theme.fg.opacity(0.8))
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
+                        .background(Theme.fg.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
                     }
                     .buttonStyle(.plain)
                 }
@@ -784,7 +951,7 @@ struct ContentView: View {
                     .frame(width: 6, height: 6)
                 Text("Generated locally • 0ms network latency")
                     .font(.system(size: 10, weight: .regular))
-                    .foregroundStyle(.white.opacity(0.5))
+                    .foregroundStyle(Theme.fg.opacity(0.5))
                 Spacer()
                 Text("Synced")
                     .font(.system(size: 10, weight: .medium))
@@ -813,11 +980,11 @@ struct ContentView: View {
                 Text(title)
                     .font(.system(size: 11, weight: .semibold))
             }
-            .foregroundStyle(isActive ? .white : .white.opacity(0.5))
+            .foregroundStyle(isActive ? Theme.fg : Theme.fg.opacity(0.5))
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(
-                isActive ? Theme.primaryBlue.opacity(0.25) : Color.white.opacity(0.04),
+                isActive ? Theme.primaryBlue.opacity(0.25) : Theme.fg.opacity(0.04),
                 in: Capsule()
             )
             .overlay(
@@ -837,17 +1004,17 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "line.3.horizontal")
                         .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.7))
+                        .foregroundStyle(Theme.fg.opacity(0.7))
                     Text("EXECUTIVE SUMMARY")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.85))
+                        .foregroundStyle(Theme.fg.opacity(0.85))
                 }
 
                 Spacer()
 
                 Text("Qwen 2.5 • 3B")
                     .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.4))
+                    .foregroundStyle(Theme.fg.opacity(0.4))
             }
 
             if let summary = notes?.summary, !summary.isEmpty {
@@ -855,7 +1022,7 @@ struct ContentView: View {
                 Text(summary)
                     .font(.system(size: 12.5))
                     .lineSpacing(3.5)
-                    .foregroundStyle(.white.opacity(0.85))
+                    .foregroundStyle(Theme.fg.opacity(0.85))
                     .textSelection(.enabled)
 
                 // Key bullet points if available
@@ -870,7 +1037,7 @@ struct ContentView: View {
                                 Text(decision)
                                     .font(.system(size: 12))
                                     .lineSpacing(3.5)
-                                    .foregroundStyle(.white.opacity(0.8))
+                                    .foregroundStyle(Theme.fg.opacity(0.8))
                                     .textSelection(.enabled)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
@@ -892,13 +1059,13 @@ struct ContentView: View {
                     Text("On-device AI will automatically generate executive summary and key points as the meeting proceeds.")
                         .font(.system(size: 11.5))
                         .lineSpacing(3)
-                        .foregroundStyle(.white.opacity(0.5))
+                        .foregroundStyle(Theme.fg.opacity(0.5))
                 }
                 .padding(.vertical, 4)
             } else {
                 Text("Select a meeting from the sidebar or record a new one to generate AI insights.")
                     .font(.system(size: 12))
-                    .foregroundStyle(.white.opacity(0.4))
+                    .foregroundStyle(Theme.fg.opacity(0.4))
                     .padding(.vertical, 4)
             }
         }
@@ -923,7 +1090,7 @@ struct ContentView: View {
                         .foregroundStyle(Theme.greenLocal)
                     Text("ACTION ITEMS & NEXT STEPS")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.85))
+                        .foregroundStyle(Theme.fg.opacity(0.85))
                 }
 
                 Spacer()
@@ -940,7 +1107,7 @@ struct ContentView: View {
                             Text(item.task)
                                 .font(.system(size: 12))
                                 .lineSpacing(3.5)
-                                .foregroundStyle(.white.opacity(0.85))
+                                .foregroundStyle(Theme.fg.opacity(0.85))
                                 .textSelection(.enabled)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
@@ -954,13 +1121,13 @@ struct ContentView: View {
                         .foregroundStyle(Theme.primaryBlue)
                     Text("Detecting tasks, commitments & next steps…")
                         .font(.system(size: 11.5))
-                        .foregroundStyle(.white.opacity(0.5))
+                        .foregroundStyle(Theme.fg.opacity(0.5))
                 }
                 .padding(.vertical, 4)
             } else {
                 Text("No action items detected.")
                     .font(.system(size: 11.5))
-                    .foregroundStyle(.white.opacity(0.4))
+                    .foregroundStyle(Theme.fg.opacity(0.4))
                     .padding(.vertical, 4)
             }
         }
@@ -1082,7 +1249,7 @@ struct MeetingCardView: View {
             HStack {
                 Text(meeting.date.formatted(.dateTime.day().month(.abbreviated).year()) + " at " + meeting.date.formatted(.dateTime.hour().minute()))
                     .font(.system(size: 10, weight: .regular))
-                    .foregroundStyle(.white.opacity(0.45))
+                    .foregroundStyle(Theme.fg.opacity(0.45))
 
                 Spacer()
 
@@ -1096,7 +1263,7 @@ struct MeetingCardView: View {
                 Button(action: onDelete) {
                     Image(systemName: "trash")
                         .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(isHovering ? 0.6 : 0.25))
+                        .foregroundStyle(Theme.fg.opacity(isHovering ? 0.6 : 0.25))
                 }
                 .buttonStyle(.plain)
             }
@@ -1104,14 +1271,14 @@ struct MeetingCardView: View {
             // Title
             Text(meeting.displayTitle)
                 .font(.system(size: 12.5, weight: .bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(Theme.fg)
                 .lineLimit(1)
 
             // Snippet
             Text(meeting.notes?.summary ?? (meeting.transcript.first?.text ?? "No transcript"))
                 .font(.system(size: 11))
                 .lineSpacing(2)
-                .foregroundStyle(.white.opacity(0.45))
+                .foregroundStyle(Theme.fg.opacity(0.45))
                 .lineLimit(2)
 
             // Speaker Badges row: [A] [E] [Y] 3 speakers
@@ -1124,7 +1291,7 @@ struct MeetingCardView: View {
 
                 Text("\(meeting.uniqueSpeakers.count) speakers")
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.45))
+                    .foregroundStyle(Theme.fg.opacity(0.45))
                     .padding(.leading, 2)
             }
             .padding(.top, 2)
@@ -1188,13 +1355,13 @@ struct FilterPill: View {
 
                 Text("\(count)")
                     .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(isSelected ? .white.opacity(0.8) : .white.opacity(0.4))
+                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Theme.fg.opacity(0.4))
             }
-            .foregroundStyle(isSelected ? .white : .white.opacity(0.75))
+            .foregroundStyle(isSelected ? Color.white : Theme.fg.opacity(0.75))
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(
-                isSelected ? Theme.primaryBlue : Color.white.opacity(0.06),
+                isSelected ? Theme.primaryBlue : Theme.fg.opacity(0.06),
                 in: Capsule()
             )
             .overlay(
@@ -1242,7 +1409,7 @@ struct TranscriptBubble: View {
 
                         Image(systemName: "pencil")
                             .font(.system(size: 8))
-                            .foregroundStyle(.white.opacity(0.4))
+                            .foregroundStyle(Theme.fg.opacity(0.4))
                     }
                     .foregroundStyle(dotColor)
                     .padding(.horizontal, 8)
@@ -1277,7 +1444,7 @@ struct TranscriptBubble: View {
                 // Timestamp
                 Text(formatTimestamp(segment.start))
                     .font(.system(size: 11, weight: .regular, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.35))
+                    .foregroundStyle(Theme.fg.opacity(0.35))
 
                 Spacer()
             }
@@ -1286,7 +1453,7 @@ struct TranscriptBubble: View {
             Text(segment.text.cleanedTranscript)
                 .font(.system(size: 13.5))
                 .lineSpacing(4)
-                .foregroundStyle(.white.opacity(0.9))
+                .foregroundStyle(Theme.fg.opacity(0.9))
                 .textSelection(.enabled)
         }
         .padding(isYou ? 12 : 6)

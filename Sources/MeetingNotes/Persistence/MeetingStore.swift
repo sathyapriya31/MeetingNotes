@@ -123,6 +123,15 @@ final class MeetingStore: ObservableObject {
         refreshSemanticIndex()
     }
 
+    func deleteAll() {
+        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        for file in files where file.pathExtension == "json" {
+            try? FileManager.default.removeItem(at: file)
+        }
+        meetings.removeAll()
+        refreshSemanticIndex()
+    }
+
     private func fileURL(for meeting: Meeting) -> URL {
         directory.appendingPathComponent("\(meeting.id.uuidString).json")
     }
