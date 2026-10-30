@@ -87,6 +87,8 @@ final class MeetingCoordinator: ObservableObject {
     @Published var isPreparing = false
     /// Why the last start attempt failed (shown in the main window), if it did.
     @Published var startError: String?
+    /// The calendar event matched to the meeting in progress, if any.
+    @Published var calendarMeeting: CalendarMeeting?
 
     let store = MeetingStore()
     private var meetingStart: Date?
@@ -97,6 +99,7 @@ final class MeetingCoordinator: ObservableObject {
     private let transcriber = TranscriptionService()
     private let diarizer = DiarizationService()
     private let summarizer = SummarizationService()
+    private let calendar = CalendarService()
     private let vad = VoiceActivityDetector()
 
     // Raw 16 kHz mono buffers kept for post-meeting diarization.
@@ -138,6 +141,7 @@ final class MeetingCoordinator: ObservableObject {
             micSamples.removeAll(); systemSamples.removeAll()
             liveTranscript.removeAll(); currentNotes = nil
             liveTitle = ""
+            calendarMeeting = nil
             vad.reset()
 
             liveSummaryTask?.cancel()
@@ -168,6 +172,17 @@ final class MeetingCoordinator: ObservableObject {
             }
             try systemTap.start { [weak self] samples in
                 Task { @MainActor in self?.ingest(samples, channel: .system) }
+            }
+
+            // Match the calendar event (title + attendees) without delaying capture.
+            let started = meetingStart ?? Date()
+            Task { [weak self, calendar] in
+                let match = await calendar.meeting(around: started)
+                guard let self, self.isRecording, let match else { return }
+                self.calendarMeeting = match
+                if self.liveTitle.isEmpty, !match.title.isEmpty {
+                    self.liveTitle = match.title
+                }
             }
 
             // Pre-warm the local LLM in the background so it's instant when stopping
@@ -260,9 +275,18 @@ final class MeetingCoordinator: ObservableObject {
         )
         liveTranscript = diarized
 
+        let attendees = calendarMeeting?.attendees ?? []
+        if !attendees.isEmpty {
+            liveTranscript = await labelSpeakers(liveTranscript, attendees: attendees)
+        }
+
         status = "Summarizing on-device…"
         do {
-            currentNotes = try await summarizer.summarize(transcript: diarized, userNotes: liveUserNotes)
+            currentNotes = try await summarizer.summarize(
+                transcript: liveTranscript,
+                attendees: attendees,
+                userNotes: liveUserNotes
+            )
             status = "Done"
         } catch {
             status = "Summarization failed: \(error.localizedDescription)"
@@ -279,10 +303,15 @@ final class MeetingCoordinator: ObservableObject {
             }
             let userNotes = liveUserNotes.trimmingCharacters(in: .whitespacesAndNewlines)
             meeting.userNotes = userNotes.isEmpty ? nil : liveUserNotes
+            if let calendarMeeting {
+                meeting.attendees = calendarMeeting.attendees
+                meeting.calendarEventID = calendarMeeting.eventID
+            }
             store.save(meeting)
             liveTranscript = []
             currentNotes = nil
             liveUserNotes = ""
+            calendarMeeting = nil
             lastSavedMeetingID = meeting.id
         }
     }
@@ -299,7 +328,11 @@ final class MeetingCoordinator: ObservableObject {
         defer { improvingMeetingID = nil }
 
         do {
-            var notes = try await summarizer.summarize(transcript: meeting.transcript, userNotes: meeting.userNotes ?? "")
+            var notes = try await summarizer.summarize(
+                transcript: meeting.transcript,
+                attendees: meeting.attendees ?? [],
+                userNotes: meeting.userNotes ?? ""
+            )
             let done = Set((meeting.notes?.actionItems ?? []).filter(\.isCompleted).map { $0.task.lowercased() })
             notes.actionItems = notes.actionItems.map { item in
                 var item = item
@@ -312,6 +345,25 @@ final class MeetingCoordinator: ObservableObject {
             store.update(latest)
         } catch {
             improveError = "Couldn't improve notes: \(error.localizedDescription)"
+        }
+    }
+
+    /// Names remote speakers after calendar attendees (see `SpeakerLabeler`).
+    private func labelSpeakers(_ segments: [TranscriptSegment], attendees: [String]) async -> [TranscriptSegment] {
+        let labels = SpeakerLabeler.remoteLabels(in: segments)
+        if let direct = SpeakerLabeler.directMapping(labels: labels, attendees: attendees) {
+            return SpeakerLabeler.apply(direct, to: segments)
+        }
+        guard SpeakerLabeler.needsInference(labels: labels, attendees: attendees) else { return segments }
+        status = "Matching speakers to attendees…"
+        do {
+            let proposal = try await summarizer.inferSpeakerNames(
+                transcript: segments, labels: labels.filter { $0 != "Them" }, attendees: attendees)
+            let mapping = SpeakerLabeler.validatedMapping(proposal, labels: labels, attendees: attendees)
+            return SpeakerLabeler.apply(mapping, to: segments)
+        } catch {
+            print("Speaker naming failed, keeping diarization labels: \(error)")
+            return segments
         }
     }
 

@@ -18,6 +18,13 @@ desert-ant-core (Voz/Who) require Apple Silicon.)
   final summary, key decisions and action items (owner, task, due date).
 - **History:** every meeting saved locally; rename speakers and meeting titles,
   filter the transcript by speaker, tick off action items, delete one or all meetings.
+- **Pinned meetings:** pin any number of meetings (hover a card → pin icon, or
+  right-click → Pin). Pinned cards show a highlighted pin; the **Pinned** filter
+  under the search field lists only pinned meetings.
+- **Calendar integration (EventKit):** when a recording starts during a calendar
+  event, the meeting takes the event's title, shows its attendees, and names the
+  remote speakers after them (see *Speaker names from the calendar*). Read-only;
+  can be turned off in Settings.
 - **Search & Ask:** search past meetings by keyword or meaning, and ask questions
   answered from your own meeting notes.
 - **Appearance:** Light, Dark or System (⌘, or the icon in the window header).
@@ -51,6 +58,8 @@ the meeting ends.
                        ▼
             Who diarization         ← system channel → "Speaker 1, 2…"
                        ▼
+            Speaker names           ← calendar attendees (direct match or LLM cues)
+                       ▼
             Final notes (Qwen2.5-3B, 10-min chunks → JSON:
                         summary, decisions, action items)
                        ▼
@@ -68,6 +77,8 @@ the meeting ends.
 | Transcription (Voz) | `Transcription/TranscriptionService.swift` |
 | Dedup | `Transcription/TranscriptDeduplicator.swift` |
 | Diarization (Who) | `Diarization/DiarizationService.swift` |
+| Calendar match (EventKit) | `Calendar/CalendarService.swift` |
+| Speaker names from attendees | `Diarization/SpeakerLabeler.swift` |
 | Summary, action items, Ask answers (Qwen) | `Summarization/SummarizationService.swift` |
 | Persistence | `Persistence/MeetingStore.swift` |
 | Semantic index & search (EmbeddingGemma) | `Search/SemanticSearchService.swift` |
@@ -120,6 +131,9 @@ open MeetingNotes.app
    - `NSMicrophoneUsageDescription` — "Records your side of the meeting."
    - `NSAudioCaptureUsageDescription` — "Records meeting audio from other apps."
      (This drives the macOS 14.4+ system-audio TCC prompt for process taps.)
+   - `NSCalendarsFullAccessUsageDescription` (and `NSCalendarsUsageDescription`)
+     — needed for calendar integration; without it, requesting access crashes.
+     `bundle.sh` adds all of these.
 
 ## Models
 
@@ -138,9 +152,29 @@ them from memory.
 - On 16 GB+ Macs, `Qwen2.5-7B-Instruct-4bit` (~4.3 GB) gives noticeably better
   summaries.
 
+## Speaker names from the calendar
+
+Audio alone can't tell which voice belongs to which invitee, so names are assigned
+conservatively after Stop (before the summary, so action-item owners use them too):
+
+- **One remote voice and one other attendee** → that attendee's name.
+- **Several remote speakers** → Qwen reads the transcript for direct evidence
+  (people addressing each other by name, introductions) and proposes a mapping.
+  Only answers that name a real invitee, and name them once, are applied.
+- **One merged "Them" voice with several attendees** → left as "Them".
+- Unmatched speakers keep "Speaker N"; the rename popover offers the attendees as
+  one-click names.
+
+The calendar is matched once, right after capture starts: the first non-all-day,
+non-declined event in progress or starting within 15 minutes, preferring events
+with invitees. Attendee names come from the invite, or from the email address
+when the invite has no name; the user, declined invitees and rooms are skipped.
+
 ## Data
 
-- Meetings: one JSON file each in `~/Library/Application Support/MeetingNotes/Meetings/`.
+- Meetings: one JSON file each in `~/Library/Application Support/MeetingNotes/Meetings/`
+  (with `attendees` and `calendarEventID` when a calendar event was matched, and
+  `pinnedAt` while the meeting is pinned).
 - Search index: `~/Library/Application Support/MeetingNotes/embeddings.json`,
   keyed by a fingerprint of each meeting's text so only new or edited meetings
   are re-embedded.

@@ -131,6 +131,18 @@ final class MeetingStore: ObservableObject {
         update(meeting)
     }
 
+    /// Pinned meetings, newest first.
+    var pinnedMeetings: [Meeting] {
+        meetings.filter(\.isPinned)
+    }
+
+    func togglePin(in meetingID: UUID) {
+        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
+        var meeting = meetings[index]
+        meeting.pinnedAt = meeting.isPinned ? nil : Date()
+        update(meeting)
+    }
+
     func toggleActionItem(in meetingID: UUID, itemID: UUID) {
         guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
         var meeting = meetings[index]

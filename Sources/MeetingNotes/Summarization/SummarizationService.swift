@@ -25,9 +25,15 @@ final class SummarizationService {
         return c
     }
 
-    /// `userNotes` are what the user typed during the meeting: they steer what the
-    /// summary focuses on and come back rewritten as `enhancedNotes`.
-    func summarize(transcript: [TranscriptSegment], userNotes: String = "") async throws -> MeetingNotes {
+    /// `attendees` (from the calendar invite) are offered as action-item owners
+    /// alongside the transcript's speaker labels. `userNotes` are what the user
+    /// typed during the meeting: they steer what the summary focuses on and come
+    /// back rewritten as `enhancedNotes`.
+    func summarize(
+        transcript: [TranscriptSegment],
+        attendees: [String] = [],
+        userNotes: String = ""
+    ) async throws -> MeetingNotes {
         // With no transcript the model has nothing to ground on and hallucinates.
         guard !transcript.isEmpty else {
             throw NSError(domain: "Summarizer", code: 2,
@@ -66,7 +72,7 @@ final class SummarizationService {
         // 3. Reduce: final structured notes as JSON.
         // No literal placeholder values in the schema: small models copy them
         // verbatim (a summary of "..." / an owner of "Qwen").
-        let speakers = Array(Set(transcript.map(\.speaker))).sorted().joined(separator: ", ")
+        let speakers = Array(Set(transcript.map(\.speaker)).union(attendees)).sorted().joined(separator: ", ")
         let enhancedSpec = userNotes.isEmpty ? "" : """
 
         - "enhancedNotes": an array of strings — the note-taker's notes rewritten as \
@@ -110,6 +116,7 @@ final class SummarizationService {
         return notes
     }
 
+
     /// True for empty strings or template echoes like "...".
     private static func isPlaceholder(_ s: String) -> Bool {
         s.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".…"))).isEmpty
@@ -134,6 +141,41 @@ final class SummarizationService {
         """
         return try await generate(prompt, container: container, maxTokens: 500)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Proposes which attendee each anonymous speaker label is, from cues in the
+    /// transcript. Returns the model's raw proposal (label → name or nil);
+    /// callers must validate it with `SpeakerLabeler.validatedMapping`.
+    func inferSpeakerNames(transcript: [TranscriptSegment], labels: [String], attendees: [String]) async throws -> [String: String?] {
+        let container = try await prepare()
+        // Introductions and names used in address cluster early; keep the prompt short.
+        var lines: [String] = []
+        var length = 0
+        for seg in transcript {
+            let line = "\(seg.speaker): \(seg.text)"
+            length += line.count
+            if length > 6_000 { break }
+            lines.append(line)
+        }
+        let prompt = """
+        This meeting transcript uses anonymous speaker labels. "You" is the person \
+        recording — never map "You". The people invited were: \(attendees.joined(separator: ", ")).
+
+        For each of these labels: \(labels.joined(separator: ", ")) — decide which invited \
+        person it is, using ONLY direct evidence in the text: people addressing each other \
+        by name ("Thanks, Priya" means the previous speaker is Priya; "Arun, can you…" \
+        means the next speaker is probably Arun) or someone introducing themselves. \
+        If there is no clear evidence for a label, use null. Never give the same name to two labels.
+
+        Respond with ONLY a JSON object mapping each label to a name or null, for example \
+        {"Speaker 1": "Name", "Speaker 2": null}.
+
+        Transcript:
+        \(lines.joined(separator: "\n"))
+        """
+        let raw = try await generate(prompt, container: container, maxTokens: 200)
+        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}") else { return [:] }
+        return (try? JSONDecoder().decode([String: String?].self, from: Data(raw[start...end].utf8))) ?? [:]
     }
 
     private func generate(_ prompt: String, container: ModelContainer, maxTokens: Int) async throws -> String {

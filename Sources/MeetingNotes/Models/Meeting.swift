@@ -30,6 +30,14 @@ struct Meeting: Codable, Identifiable {
     var folder: String? = nil
     /// What the user typed in "My Notes", kept as written.
     var userNotes: String? = nil
+    /// People on the calendar invite (the user excluded), when one was matched.
+    /// Optional so meetings saved before calendar integration still decode.
+    var attendees: [String]?
+    var calendarEventID: String?
+    /// When the meeting was pinned; nil when unpinned.
+    var pinnedAt: Date?
+
+    var isPinned: Bool { pinnedAt != nil }
 
     var displayTitle: String {
         if let title, !title.trimmingCharacters(in: .whitespaces).isEmpty {

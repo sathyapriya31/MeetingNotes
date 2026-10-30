@@ -81,17 +81,48 @@ struct AppearancePicker: View {
 }
 
 struct SettingsView: View {
+    @AppStorage(CalendarService.enabledKey) private var calendarEnabled = true
+    @State private var calendarStatus = CalendarService.authorizationStatus
+
     var body: some View {
         Form {
-            AppearancePicker()
-                .pickerStyle(.segmented)
-            Text("System follows the macOS appearance setting.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Section("Appearance") {
+                AppearancePicker()
+                    .pickerStyle(.segmented)
+                Text("System follows the macOS appearance setting.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Calendar") {
+                Toggle("Use Calendar to name meetings and speakers", isOn: $calendarEnabled)
+                Text(calendarStatusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if calendarEnabled, calendarStatus == .denied || calendarStatus == .restricted || calendarStatus == .writeOnly {
+                    Button("Open Calendar Privacy Settings") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                }
+            }
         }
+        .onAppear { calendarStatus = CalendarService.authorizationStatus }
         .formStyle(.grouped)
-        .frame(width: 380)
+        .frame(width: 420)
         .fixedSize()
+    }
+
+    private var calendarStatusText: String {
+        guard calendarEnabled else { return "Meetings keep their own titles; speakers stay \"Speaker 1\", \"Speaker 2\"…" }
+        switch calendarStatus {
+        case .fullAccess:
+            return "When a recording starts during a calendar event, its title and attendees are used. Read-only."
+        case .notDetermined:
+            return "macOS will ask for Calendar access the first time you record."
+        default:
+            return "Calendar access is off. Allow MeetingNotes under Privacy & Security → Calendars."
+        }
     }
 }
 
@@ -149,6 +180,7 @@ struct ContentView: View {
     @State private var selectedMeetingID: UUID?
     @AppStorage(AppAppearance.appearanceKey) private var appearance = AppAppearance.defaultValue
     @State private var searchText: String = ""
+    @State private var showPinnedOnly = false
     @FocusState private var isSearchFocused: Bool
     /// Best EmbeddingGemma similarity per meeting for the current `searchText`.
     @State private var semanticScores: [UUID: Float] = [:]
@@ -209,6 +241,13 @@ struct ContentView: View {
         selectedMeetingID == nil
     }
 
+    /// Invitees of the selected meeting, or of the calendar event matched to
+    /// the meeting being recorded.
+    private var meetingAttendees: [String] {
+        if let meeting = selectedMeeting { return meeting.attendees ?? [] }
+        return coordinator.calendarMeeting?.attendees ?? []
+    }
+
     private var currentTitle: String {
         if let meeting = selectedMeeting {
             return meeting.displayTitle
@@ -220,11 +259,14 @@ struct ContentView: View {
     /// (EmbeddingGemma), best match first.
     private var filteredPreviousMeetings: [Meeting] {
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let matches: [Meeting]
         if trimmed.isEmpty {
-            return scopedMeetings
+            matches = scopedMeetings
+        } else {
+            let keywordMatches = keywordFilteredMeetings(trimmed.lowercased())
+            matches = keywordMatches + semanticOnlyMatches(excluding: Set(keywordMatches.map(\.id)))
         }
-        let keywordMatches = keywordFilteredMeetings(trimmed.lowercased())
-        return keywordMatches + semanticOnlyMatches(excluding: Set(keywordMatches.map(\.id)))
+        return showPinnedOnly ? matches.filter(\.isPinned) : matches
     }
 
     private func semanticOnlyMatches(excluding ids: Set<UUID>) -> [Meeting] {
@@ -267,6 +309,7 @@ struct ContentView: View {
 
             // 3. Speakers (names, initials, or count phrase)
             if meeting.uniqueSpeakers.contains(where: { $0.lowercased().contains(q) }) { return true }
+            if (meeting.attendees ?? []).contains(where: { $0.lowercased().contains(q) }) { return true }
             if "\(meeting.uniqueSpeakers.count) speakers".contains(q) || "\(meeting.uniqueSpeakers.count) speaker".contains(q) { return true }
 
             // 4. Notes: Summary, Key Decisions, Action Items (task & owner)
@@ -453,14 +496,27 @@ struct ContentView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 FilterPill(title: "All", count: store.meetings.count, dotColor: nil,
-                           isSelected: folderFilter == .all) {
+                           isSelected: folderFilter == .all && !showPinnedOnly) {
                     folderFilter = .all
+                    showPinnedOnly = false
+                }
+                if !store.pinnedMeetings.isEmpty || showPinnedOnly {
+                    FilterPill(
+                        title: "Pinned",
+                        count: store.pinnedMeetings.count,
+                        dotColor: Color.orange,
+                        systemImage: "pin.fill",
+                        isSelected: showPinnedOnly
+                    ) {
+                        showPinnedOnly.toggle()
+                    }
                 }
                 let unfiled = store.meetings.filter { $0.folder == nil }.count
                 if !store.folders.isEmpty && unfiled > 0 {
                     FilterPill(title: "Unfiled", count: unfiled, dotColor: nil,
-                               isSelected: folderFilter == .unfiled) {
+                               isSelected: folderFilter == .unfiled && !showPinnedOnly) {
                         folderFilter = .unfiled
+                        showPinnedOnly = false
                     }
                 }
                 ForEach(store.folders, id: \.self) { folder in
@@ -469,9 +525,10 @@ struct ContentView: View {
                         count: store.meetings.filter { $0.folder == folder }.count,
                         dotColor: nil,
                         systemImage: "folder.fill",
-                        isSelected: folderFilter == .named(folder)
+                        isSelected: folderFilter == .named(folder) && !showPinnedOnly
                     ) {
                         folderFilter = .named(folder)
+                        showPinnedOnly = false
                     }
                     .contextMenu {
                         Button("Rename…") { promptForFolder(.rename(folder)) }
@@ -726,13 +783,21 @@ struct ContentView: View {
                         VStack(spacing: 8) {
                             let isSearching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             Text(store.meetings.isEmpty ? "No meetings yet"
+                                 : showPinnedOnly && store.pinnedMeetings.isEmpty ? "No pinned meetings"
                                  : isSearching ? "No matches found" : "No meetings here yet")
                                 .font(.system(size: 12))
                                 .foregroundStyle(Theme.fg.opacity(0.4))
-                            if isSearching || isScoped {
+                            if showPinnedOnly && store.pinnedMeetings.isEmpty {
+                                Text("Hover a meeting and click the pin icon to pin it.")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Theme.fg.opacity(0.35))
+                                    .multilineTextAlignment(.center)
+                            }
+                            if isSearching || isScoped || showPinnedOnly {
                                 Button("Clear filter") {
                                     searchText = ""
                                     folderFilter = .all
+                                    showPinnedOnly = false
                                 }
                                 .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(Theme.primaryBlue)
@@ -742,25 +807,7 @@ struct ContentView: View {
                         .padding(.top, 24)
                     } else {
                         ForEach(filteredPreviousMeetings) { meeting in
-                            MeetingCardView(
-                                meeting: meeting,
-                                isSelected: selectedMeetingID == meeting.id,
-                                onSelect: {
-                                    selectedMeetingID = meeting.id
-                                    selectedSpeakerFilter = nil
-                                },
-                                onDelete: {
-                                    if selectedMeetingID == meeting.id {
-                                        selectedMeetingID = store.meetings.first(where: { $0.id != meeting.id })?.id
-                                    }
-                                    store.delete(meeting)
-                                }
-                            )
-                            .contextMenu {
-                                Menu("Move to Folder") {
-                                    folderMenuItems(for: meeting)
-                                }
-                            }
+                            meetingCard(meeting)
                         }
                     }
                 }
@@ -947,11 +994,27 @@ struct ContentView: View {
             }
             .padding(.horizontal, 24)
             .padding(.top, 18)
-            .padding(.bottom, selectedMeeting == nil ? 12 : 6)
+            .padding(.bottom, (selectedMeeting == nil && meetingAttendees.isEmpty) ? 12 : 4)
 
             if let meeting = selectedMeeting {
                 meetingFolderRow(meeting)
-                    .padding(.bottom, 10)
+                    .padding(.bottom, meetingAttendees.isEmpty ? 10 : 4)
+            }
+
+            if !meetingAttendees.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "calendar")
+                        .font(.system(size: 11))
+                    Text("With " + meetingAttendees.joined(separator: ", "))
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer()
+                }
+                .foregroundStyle(Theme.fg.opacity(0.5))
+                .help(meetingAttendees.joined(separator: "\n"))
+                .padding(.horizontal, 24)
+                .padding(.bottom, 12)
             }
 
             // Speaker Filter Pill Bar
@@ -1048,6 +1111,7 @@ struct ContentView: View {
                                 TranscriptBubble(
                                     segment: segment,
                                     isYou: segment.speaker == "You" || segment.channel == .mic,
+                                    suggestions: meetingAttendees.filter { $0 != segment.speaker },
                                     onRename: { newName in
                                         if let meeting = selectedMeeting {
                                             store.renameSpeaker(in: meeting.id, from: segment.speaker, to: newName)
@@ -1186,6 +1250,41 @@ struct ContentView: View {
             .background(Theme.bgApp)
             .overlay(alignment: .top) {
                 Divider().background(Theme.borderSubtle)
+            }
+        }
+    }
+
+    private func meetingCard(_ meeting: Meeting) -> some View {
+        MeetingCardView(
+            meeting: meeting,
+            isSelected: selectedMeetingID == meeting.id,
+            onSelect: {
+                selectedMeetingID = meeting.id
+                selectedSpeakerFilter = nil
+            },
+            onTogglePin: {
+                store.togglePin(in: meeting.id)
+            },
+            onDelete: {
+                if selectedMeetingID == meeting.id {
+                    selectedMeetingID = store.meetings.first(where: { $0.id != meeting.id })?.id
+                }
+                store.delete(meeting)
+            }
+        )
+        .contextMenu {
+            Button(meeting.isPinned ? "Unpin" : "Pin") {
+                store.togglePin(in: meeting.id)
+            }
+            Menu("Move to Folder") {
+                folderMenuItems(for: meeting)
+            }
+            Divider()
+            Button("Delete", role: .destructive) {
+                if selectedMeetingID == meeting.id {
+                    selectedMeetingID = store.meetings.first(where: { $0.id != meeting.id })?.id
+                }
+                store.delete(meeting)
             }
         }
     }
@@ -1686,13 +1785,14 @@ struct MeetingCardView: View {
     let meeting: Meeting
     let isSelected: Bool
     let onSelect: () -> Void
+    let onTogglePin: () -> Void
     let onDelete: () -> Void
 
     @State private var isHovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // Date + Duration pill + Trash button
+            // Date + Duration pill + Pin + Trash buttons
             HStack {
                 Text(meeting.date.formatted(.dateTime.day().month(.abbreviated).year()) + " at " + meeting.date.formatted(.dateTime.hour().minute()))
                     .font(.system(size: 10, weight: .regular))
@@ -1706,6 +1806,23 @@ struct MeetingCardView: View {
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1.5)
                     .background(Theme.cyanWave.opacity(0.14), in: RoundedRectangle(cornerRadius: 4))
+
+                // Highlighted while pinned; otherwise shown on hover only.
+                if meeting.isPinned || isHovering {
+                    Button(action: onTogglePin) {
+                        Image(systemName: meeting.isPinned ? "pin.fill" : "pin")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(meeting.isPinned ? Color.orange : Theme.fg.opacity(0.6))
+                            .frame(width: 18, height: 18)
+                            .background(
+                                meeting.isPinned ? Color.orange.opacity(0.15) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 4)
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(meeting.isPinned ? "Unpin meeting" : "Pin meeting")
+                }
 
                 Button(action: onDelete) {
                     Image(systemName: "trash")
@@ -1840,6 +1957,8 @@ struct FilterPill: View {
 struct TranscriptBubble: View {
     let segment: TranscriptSegment
     let isYou: Bool
+    /// Calendar attendees offered as one-click names in the rename popover.
+    var suggestions: [String] = []
     let onRename: (String) -> Void
 
     @State private var isRenaming = false
@@ -1883,6 +2002,23 @@ struct TranscriptBubble: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Rename Speaker")
                             .font(.system(size: 13, weight: .bold))
+                        if !suggestions.isEmpty {
+                            Text("From the calendar invite")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), alignment: .leading)],
+                                      alignment: .leading, spacing: 6) {
+                                ForEach(suggestions, id: \.self) { name in
+                                    Button(name) {
+                                        onRename(name)
+                                        isRenaming = false
+                                    }
+                                    .controlSize(.small)
+                                    .lineLimit(1)
+                                }
+                            }
+                            .frame(width: 200)
+                        }
                         TextField("e.g. Alex", text: $newSpeakerName)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 200)
