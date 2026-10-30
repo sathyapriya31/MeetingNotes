@@ -25,26 +25,39 @@ final class SummarizationService {
         return c
     }
 
-    func summarize(transcript: [TranscriptSegment]) async throws -> MeetingNotes {
+    /// `userNotes` are what the user typed during the meeting: they steer what the
+    /// summary focuses on and come back rewritten as `enhancedNotes`.
+    func summarize(transcript: [TranscriptSegment], userNotes: String = "") async throws -> MeetingNotes {
         // With no transcript the model has nothing to ground on and hallucinates.
         guard !transcript.isEmpty else {
             throw NSError(domain: "Summarizer", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "Nothing to summarize — the transcript is empty"])
         }
         let container = try await prepare()
+        let userNotes = userNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let notesBlock = userNotes.isEmpty ? "" : """
+
+
+        The note-taker wrote these notes during the meeting:
+        \(userNotes)
+        """
+        let focusLine = userNotes.isEmpty ? "" : " Give extra detail on anything the note-taker's notes mention."
 
         // 1. Chunk transcript into ~10-minute windows.
         let chunks = chunk(transcript, seconds: 600)
 
-        // 2. Map: summarize each chunk.
+        // 2. Map: summarize each chunk. The user's notes ride along so details on
+        // the topics they flagged survive into the chunk summaries.
         var chunkSummaries: [String] = []
         for (i, chunk) in chunks.enumerated() {
             try Task.checkCancellation()
             let text = render(chunk)
             let prompt = """
             Summarize this portion (\(i + 1)/\(chunks.count)) of a meeting transcript \
-            in 4-6 sentences. Preserve names, decisions, numbers, and commitments exactly.
+            in 4-6 sentences. Preserve names, decisions, numbers, and commitments exactly.\
+            \(focusLine)\(notesBlock)
 
+            Transcript:
             \(text)
             """
             chunkSummaries.append(try await generate(prompt, container: container, maxTokens: 400))
@@ -54,6 +67,16 @@ final class SummarizationService {
         // No literal placeholder values in the schema: small models copy them
         // verbatim (a summary of "..." / an owner of "Qwen").
         let speakers = Array(Set(transcript.map(\.speaker))).sorted().joined(separator: ", ")
+        let enhancedSpec = userNotes.isEmpty ? "" : """
+
+        - "enhancedNotes": an array of strings — the note-taker's notes rewritten as \
+        clear, complete bullet points, in the same order. Keep every point they wrote \
+        and add names, numbers and details from the meeting. Do not add points on \
+        topics their notes don't mention.
+
+        Treat the note-taker's notes as the most important points of the meeting: \
+        the summary, decisions and action items must cover them.
+        """
         let reducePrompt = """
         You are an expert meeting notetaker. Based on these meeting section summaries, \
         respond with ONLY a JSON object (no markdown fences) with exactly these keys:
@@ -61,18 +84,29 @@ final class SummarizationService {
         - "keyDecisions": an array of short strings, one per decision made.
         - "actionItems": an array of objects with "owner" (the person responsible — \
         one of: \(speakers), or a name mentioned in the meeting), "task", and "due" \
-        (the deadline as stated, or null).
+        (the deadline as stated, or null).\(enhancedSpec)\(notesBlock)
 
         Section summaries:
         \(chunkSummaries.enumerated().map { "Section \($0.offset + 1): \($0.element)" }.joined(separator: "\n\n"))
         """
-        let raw = try await generate(reducePrompt, container: container, maxTokens: 800)
+        let raw = try await generate(reducePrompt, container: container, maxTokens: userNotes.isEmpty ? 800 : 1200)
         var notes = try parse(raw)
         if Self.isPlaceholder(notes.summary) {
             notes.summary = chunkSummaries.joined(separator: " ")
         }
         notes.keyDecisions.removeAll(where: Self.isPlaceholder)
         notes.actionItems.removeAll { Self.isPlaceholder($0.task) }
+        if userNotes.isEmpty {
+            notes.enhancedNotes = nil
+        } else {
+            let enhanced = (notes.enhancedNotes ?? []).filter { !Self.isPlaceholder($0) }
+            // If the model skipped the key, fall back to the user's own lines.
+            notes.enhancedNotes = enhanced.isEmpty
+                ? userNotes.components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespaces.union(CharacterSet(charactersIn: "-•*"))) }
+                    .filter { !$0.isEmpty }
+                : enhanced
+        }
         return notes
     }
 

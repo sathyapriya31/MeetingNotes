@@ -164,8 +164,41 @@ struct ContentView: View {
     @State private var showClearAllAlert = false
     @State private var insightsTab: InsightsTab = .insights
     @State private var askMessages: [AskMessage] = []
+    @State private var folderFilter: FolderFilter = .all
+    @State private var folderPrompt: FolderPrompt? = nil
+    @State private var folderNameText = ""
+    @State private var folderToDelete: String? = nil
+    @State private var isEditingSummary = false
+    @State private var summaryDraft = ""
+    @State private var decisionsDraft = ""
 
     private enum InsightsTab { case insights, ask }
+
+    private enum FolderFilter: Hashable {
+        case all, unfiled
+        case named(String)
+    }
+
+    /// The "name a folder" alert: create (optionally filing a meeting into it) or rename.
+    private enum FolderPrompt {
+        case create(fileMeeting: UUID?)
+        case rename(String)
+    }
+
+    /// Meetings in the selected folder; search runs within these.
+    private var scopedMeetings: [Meeting] {
+        store.meetings.filter { meeting in
+            switch folderFilter {
+            case .all: return true
+            case .unfiled: return meeting.folder == nil
+            case .named(let name): return meeting.folder == name
+            }
+        }
+    }
+
+    private var isScoped: Bool {
+        folderFilter != .all
+    }
 
     private var selectedMeeting: Meeting? {
         guard let id = selectedMeetingID else { return nil }
@@ -188,14 +221,14 @@ struct ContentView: View {
     private var filteredPreviousMeetings: [Meeting] {
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
-            return store.meetings
+            return scopedMeetings
         }
         let keywordMatches = keywordFilteredMeetings(trimmed.lowercased())
         return keywordMatches + semanticOnlyMatches(excluding: Set(keywordMatches.map(\.id)))
     }
 
     private func semanticOnlyMatches(excluding ids: Set<UUID>) -> [Meeting] {
-        let scored = store.meetings.compactMap { meeting -> (Meeting, Float)? in
+        let scored = scopedMeetings.compactMap { meeting -> (Meeting, Float)? in
             guard !ids.contains(meeting.id),
                   let score = semanticScores[meeting.id],
                   score >= Self.semanticThreshold else { return nil }
@@ -215,10 +248,13 @@ struct ContentView: View {
     }
 
     private func keywordFilteredMeetings(_ q: String) -> [Meeting] {
-        store.meetings.filter { meeting in
+        scopedMeetings.filter { meeting in
             // 1. Title & Display Title
             if meeting.displayTitle.lowercased().contains(q) { return true }
             if let title = meeting.title, title.lowercased().contains(q) { return true }
+
+            // 1b. Folder name
+            if let folder = meeting.folder, folder.lowercased().contains(q) { return true }
 
             // 2. Date & Time (formatted variations)
             let dateCard = (meeting.date.formatted(.dateTime.day().month(.abbreviated).year()) + " at " + meeting.date.formatted(.dateTime.hour().minute())).lowercased()
@@ -242,7 +278,9 @@ struct ContentView: View {
                 }) {
                     return true
                 }
+                if (notes.enhancedNotes ?? []).contains(where: { $0.lowercased().contains(q) }) { return true }
             }
+            if let userNotes = meeting.userNotes, userNotes.lowercased().contains(q) { return true }
 
             // 5. Transcript text & segment speakers
             if meeting.transcript.contains(where: { $0.text.lowercased().contains(q) || $0.speaker.lowercased().contains(q) }) {
@@ -306,6 +344,9 @@ struct ContentView: View {
                 selectedMeetingID = nil
             }
         }
+        .onChange(of: selectedMeetingID) {
+            isEditingSummary = false
+        }
         .onChange(of: coordinator.lastSavedMeetingID) {
             if let id = coordinator.lastSavedMeetingID {
                 selectedMeetingID = id
@@ -320,6 +361,166 @@ struct ContentView: View {
         } message: {
             Text("Are you sure you want to delete all recorded meetings? This action cannot be undone.")
         }
+        .alert(folderPromptTitle, isPresented: Binding(
+            get: { folderPrompt != nil },
+            set: { if !$0 { folderPrompt = nil } }
+        )) {
+            TextField("Folder name", text: $folderNameText)
+            Button("Cancel", role: .cancel) { folderPrompt = nil }
+            Button(folderPromptIsRename ? "Rename" : "Create") { commitFolderPrompt() }
+        }
+        .alert("Delete Folder \"\(folderToDelete ?? "")\"?", isPresented: Binding(
+            get: { folderToDelete != nil },
+            set: { if !$0 { folderToDelete = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { folderToDelete = nil }
+            Button("Delete Folder", role: .destructive) {
+                if let name = folderToDelete {
+                    if folderFilter == .named(name) { folderFilter = .all }
+                    store.deleteFolder(name)
+                }
+                folderToDelete = nil
+            }
+        } message: {
+            Text("Meetings in this folder are kept and moved to Unfiled.")
+        }
+    }
+
+    // MARK: - Folders
+
+    private var folderPromptIsRename: Bool {
+        if case .rename = folderPrompt { return true }
+        return false
+    }
+
+    private var folderPromptTitle: String {
+        folderPromptIsRename ? "Rename Folder" : "New Folder"
+    }
+
+    private func promptForFolder(_ prompt: FolderPrompt) {
+        if case .rename(let name) = prompt {
+            folderNameText = name
+        } else {
+            folderNameText = ""
+        }
+        folderPrompt = prompt
+    }
+
+    private func commitFolderPrompt() {
+        let name = folderNameText.trimmingCharacters(in: .whitespaces)
+        switch folderPrompt {
+        case .create(let meetingID):
+            if let meetingID {
+                store.moveMeeting(meetingID, toFolder: name)
+            } else {
+                store.createFolder(name)
+            }
+        case .rename(let oldName):
+            store.renameFolder(oldName, to: name)
+            if folderFilter == .named(oldName), store.folders.contains(name) {
+                folderFilter = .named(name)
+            }
+        case nil:
+            break
+        }
+        folderPrompt = nil
+    }
+
+    /// "Move to Folder" menu items, shared by the meeting card's context menu and the detail header.
+    @ViewBuilder
+    private func folderMenuItems(for meeting: Meeting) -> some View {
+        Button {
+            store.moveMeeting(meeting.id, toFolder: nil)
+        } label: {
+            Label("Unfiled", systemImage: meeting.folder == nil ? "checkmark" : "tray")
+        }
+        if !store.folders.isEmpty {
+            Divider()
+            ForEach(store.folders, id: \.self) { folder in
+                Button {
+                    store.moveMeeting(meeting.id, toFolder: folder)
+                } label: {
+                    Label(folder, systemImage: meeting.folder == folder ? "checkmark" : "folder")
+                }
+            }
+        }
+        Divider()
+        Button("New Folder…") { promptForFolder(.create(fileMeeting: meeting.id)) }
+    }
+
+    /// Sidebar folder filter row.
+    private var folderBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                FilterPill(title: "All", count: store.meetings.count, dotColor: nil,
+                           isSelected: folderFilter == .all) {
+                    folderFilter = .all
+                }
+                let unfiled = store.meetings.filter { $0.folder == nil }.count
+                if !store.folders.isEmpty && unfiled > 0 {
+                    FilterPill(title: "Unfiled", count: unfiled, dotColor: nil,
+                               isSelected: folderFilter == .unfiled) {
+                        folderFilter = .unfiled
+                    }
+                }
+                ForEach(store.folders, id: \.self) { folder in
+                    FilterPill(
+                        title: folder,
+                        count: store.meetings.filter { $0.folder == folder }.count,
+                        dotColor: nil,
+                        systemImage: "folder.fill",
+                        isSelected: folderFilter == .named(folder)
+                    ) {
+                        folderFilter = .named(folder)
+                    }
+                    .contextMenu {
+                        Button("Rename…") { promptForFolder(.rename(folder)) }
+                        Button("Delete Folder…", role: .destructive) { folderToDelete = folder }
+                    }
+                }
+                Button {
+                    promptForFolder(.create(fileMeeting: nil))
+                } label: {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.fg.opacity(0.6))
+                        .frame(width: 26, height: 22)
+                        .background(Theme.fg.opacity(0.06), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("New folder (right-click a folder to rename or delete it)")
+            }
+            .padding(.horizontal, 12)
+        }
+    }
+
+    /// Folder menu under the meeting title (saved meetings only).
+    private func meetingFolderRow(_ meeting: Meeting) -> some View {
+        HStack(spacing: 6) {
+            Menu {
+                folderMenuItems(for: meeting)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: meeting.folder == nil ? "tray" : "folder.fill")
+                    Text(meeting.folder ?? "Unfiled")
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.fg.opacity(0.75))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(Theme.fg.opacity(0.06), in: Capsule())
+                .overlay(Capsule().stroke(Theme.borderSubtle, lineWidth: 1))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Move to folder")
+
+            Spacer()
+        }
+        .padding(.horizontal, 24)
     }
 
     // MARK: - Header Bar
@@ -464,7 +665,7 @@ struct ContentView: View {
                     let byMeaning = semanticMatchCount
                     Text(isFiltering
                          ? "\(filteredPreviousMeetings.count) found" + (byMeaning > 0 ? " · \(byMeaning) by meaning" : "")
-                         : "\(store.meetings.count) recorded")
+                         : isScoped ? "\(scopedMeetings.count) shown" : "\(store.meetings.count) recorded")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(isFiltering ? Theme.cyanWave : Theme.fg.opacity(0.5))
                         .padding(.horizontal, 6)
@@ -514,6 +715,8 @@ struct ContentView: View {
                         .stroke(isSearchFocused ? Theme.borderActive.opacity(0.8) : Theme.borderSubtle, lineWidth: 1)
                 )
                 .padding(.horizontal, 12)
+
+                folderBar
             }
 
             // Scrollable List of Previous Meeting Cards
@@ -521,12 +724,15 @@ struct ContentView: View {
                 LazyVStack(spacing: 8) {
                     if filteredPreviousMeetings.isEmpty {
                         VStack(spacing: 8) {
-                            Text(store.meetings.isEmpty ? "No meetings yet" : "No matches found")
+                            let isSearching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            Text(store.meetings.isEmpty ? "No meetings yet"
+                                 : isSearching ? "No matches found" : "No meetings here yet")
                                 .font(.system(size: 12))
                                 .foregroundStyle(Theme.fg.opacity(0.4))
-                            if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            if isSearching || isScoped {
                                 Button("Clear filter") {
                                     searchText = ""
+                                    folderFilter = .all
                                 }
                                 .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(Theme.primaryBlue)
@@ -550,6 +756,11 @@ struct ContentView: View {
                                     store.delete(meeting)
                                 }
                             )
+                            .contextMenu {
+                                Menu("Move to Folder") {
+                                    folderMenuItems(for: meeting)
+                                }
+                            }
                         }
                     }
                 }
@@ -736,7 +947,12 @@ struct ContentView: View {
             }
             .padding(.horizontal, 24)
             .padding(.top, 18)
-            .padding(.bottom, 12)
+            .padding(.bottom, selectedMeeting == nil ? 12 : 6)
+
+            if let meeting = selectedMeeting {
+                meetingFolderRow(meeting)
+                    .padding(.bottom, 10)
+            }
 
             // Speaker Filter Pill Bar
             if !segments.isEmpty {
@@ -893,7 +1109,7 @@ struct ContentView: View {
                     .buttonStyle(.plain)
 
                     Button {
-                        copyFullNotes(notes)
+                        copyFullNotes(notes, userNotes: selectedMeeting?.userNotes ?? coordinator.liveUserNotes)
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "note.text")
@@ -928,6 +1144,11 @@ struct ContentView: View {
                 // Insights Content
                 ScrollView(showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 14) {
+                        MyNotesCard(meeting: selectedMeeting)
+                            .id(selectedMeetingID)   // fresh draft per meeting
+                        if let enhanced = notes?.enhancedNotes, !enhanced.isEmpty {
+                            enhancedNotesCard(enhanced)
+                        }
                         executiveSummaryCard(notes: notes)
                         actionItemsCard(notes: notes)
                     }
@@ -1012,12 +1233,42 @@ struct ContentView: View {
 
                 Spacer()
 
-                Text("Qwen 2.5 • 3B")
-                    .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(Theme.fg.opacity(0.4))
+                if let meeting = selectedMeeting, !isEditingSummary {
+                    Button {
+                        summaryDraft = meeting.notes?.summary ?? ""
+                        decisionsDraft = (meeting.notes?.keyDecisions ?? []).joined(separator: "\n")
+                        isEditingSummary = true
+                    } label: {
+                        Label("Edit", systemImage: "pencil")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(Theme.fg.opacity(0.6))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Edit the summary and key decisions")
+                } else if !isEditingSummary {
+                    Text("Qwen 2.5 • 3B")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(Theme.fg.opacity(0.4))
+                }
             }
 
-            if let summary = notes?.summary, !summary.isEmpty {
+            if isEditingSummary, let meeting = selectedMeeting {
+                NotesTextEditor(text: $summaryDraft, placeholder: "Summary", height: 130)
+                Text("Key decisions — one per line")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(Theme.fg.opacity(0.5))
+                NotesTextEditor(text: $decisionsDraft, placeholder: "e.g. Ship v2 on Friday", height: 90)
+                HStack {
+                    Button("Cancel") { isEditingSummary = false }
+                    Spacer()
+                    Button("Save") {
+                        store.updateSummary(in: meeting.id, summary: summaryDraft, decisions: decisionsDraft)
+                        isEditingSummary = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .controlSize(.small)
+            } else if let summary = notes?.summary, !summary.isEmpty {
                 // Paragraph
                 Text(summary)
                     .font(.system(size: 12.5))
@@ -1067,6 +1318,50 @@ struct ContentView: View {
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.fg.opacity(0.4))
                     .padding(.vertical, 4)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Theme.bgCard, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Theme.borderSubtle, lineWidth: 1)
+        )
+    }
+
+    // MARK: - Enhanced Notes Card
+
+    /// The user's own notes, rewritten by the LLM with details from the transcript.
+    private func enhancedNotesCard(_ bullets: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Color.yellow)
+                Text("ENHANCED NOTES")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Theme.fg.opacity(0.85))
+                Spacer()
+                Text("From your notes")
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(Theme.fg.opacity(0.4))
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(Array(bullets.enumerated()), id: \.offset) { _, bullet in
+                    HStack(alignment: .top, spacing: 8) {
+                        Circle()
+                            .fill(Color.yellow)
+                            .frame(width: 4, height: 4)
+                            .padding(.top, 6)
+                        Text(bullet)
+                            .font(.system(size: 12))
+                            .lineSpacing(3.5)
+                            .foregroundStyle(Theme.fg.opacity(0.85))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1180,9 +1475,13 @@ struct ContentView: View {
         }
     }
 
-    private func copyFullNotes(_ notes: MeetingNotes?) {
+    private func copyFullNotes(_ notes: MeetingNotes?, userNotes: String) {
         guard let notes = notes else { return }
-        var md = "# Meeting Notes\n\n## Executive Summary\n\(notes.summary)\n\n"
+        var md = "# Meeting Notes\n\n"
+        if let enhanced = notes.enhancedNotes, !enhanced.isEmpty {
+            md += "## Notes\n" + enhanced.map { "- \($0)\n" }.joined() + "\n"
+        }
+        md += "## Executive Summary\n\(notes.summary)\n\n"
         if !notes.keyDecisions.isEmpty {
             md += "## Key Decisions\n"
             for d in notes.keyDecisions {
@@ -1196,12 +1495,160 @@ struct ContentView: View {
                 md += "- \(item.task)\n"
             }
         }
+        let mine = userNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !mine.isEmpty {
+            md += "\n## My Notes\n\(mine)\n"
+        }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(md, forType: .string)
         withAnimation { copiedAlert = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             withAnimation { copiedAlert = false }
         }
+    }
+}
+
+// MARK: - My Notes Card
+
+/// The user's own notes. For the live meeting it edits `coordinator.liveUserNotes`
+/// (they steer the summary on Stop); for a saved meeting it edits a draft that is
+/// saved after a short pause, and offers "Improve with AI" to regenerate the notes.
+struct MyNotesCard: View {
+    @EnvironmentObject var coordinator: MeetingCoordinator
+    @EnvironmentObject var store: MeetingStore
+
+    /// `nil` = the live meeting.
+    let meeting: Meeting?
+
+    @State private var draft = ""
+
+    private var isImproving: Bool {
+        meeting != nil && coordinator.improvingMeetingID == meeting?.id
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                HStack(spacing: 6) {
+                    Image(systemName: "pencil.line")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Color.yellow)
+                    Text("MY NOTES")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.fg.opacity(0.85))
+                }
+
+                Spacer()
+
+                if let meeting {
+                    Button {
+                        save()
+                        Task { await coordinator.improveNotes(for: meeting.id) }
+                    } label: {
+                        HStack(spacing: 4) {
+                            if isImproving {
+                                ProgressView()
+                                    .controlSize(.mini)
+                            } else {
+                                Image(systemName: "sparkles")
+                                    .font(.system(size: 10))
+                            }
+                            Text(isImproving ? "Improving…" : "Improve with AI")
+                                .font(.system(size: 10.5, weight: .semibold))
+                        }
+                        .foregroundStyle(Theme.primaryBlue)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Theme.primaryBlue.opacity(0.12), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(coordinator.isRecording || coordinator.improvingMeetingID != nil || meeting.transcript.isEmpty)
+                    .help(coordinator.isRecording
+                          ? "Available after the current recording stops"
+                          : "Rewrite the summary, decisions, action items and enhanced notes using your notes")
+                }
+            }
+
+            NotesTextEditor(
+                text: meeting == nil ? $coordinator.liveUserNotes : $draft,
+                placeholder: meeting == nil
+                    ? "Jot down key points as the meeting goes — names, numbers, things to follow up…"
+                    : "Add your own notes, then Improve with AI to fold them into the summary.",
+                height: 120
+            )
+
+            if meeting == nil {
+                Text(coordinator.isRecording
+                     ? "When you stop, on-device AI expands these into Enhanced Notes using the transcript."
+                     : "You can start typing before you press New Recording.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Theme.fg.opacity(0.4))
+            } else if let error = coordinator.improveError, coordinator.improvingMeetingID == nil {
+                Text(error)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Color.orange)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Theme.bgCard, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Theme.borderSubtle, lineWidth: 1)
+        )
+        .onAppear {
+            draft = meeting?.userNotes ?? ""
+            coordinator.improveError = nil
+        }
+        .task(id: draft) {
+            // Debounce: each save rewrites the meeting file and re-embeds it for search.
+            guard meeting != nil else { return }
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            save()
+        }
+        .onDisappear(perform: save)
+    }
+
+    private func save() {
+        guard let meeting else { return }
+        store.updateUserNotes(in: meeting.id, to: draft)
+    }
+}
+
+// MARK: - Notes Text Editor
+
+/// Multi-line editor styled like the app's search field, with a placeholder.
+struct NotesTextEditor: View {
+    @Binding var text: String
+    let placeholder: String
+    let height: CGFloat
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            if text.isEmpty {
+                Text(placeholder)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.fg.opacity(0.3))
+                    .padding(.horizontal, 5)
+                    .allowsHitTesting(false)
+            }
+            TextEditor(text: $text)
+                .font(.system(size: 12))
+                .lineSpacing(3)
+                .foregroundStyle(Theme.fg.opacity(0.9))
+                .scrollContentBackground(.hidden)
+                .focused($isFocused)
+        }
+        .frame(height: height)
+        .padding(8)
+        .background(Theme.bgSurface, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isFocused ? Theme.borderActive.opacity(0.8) : Theme.borderSubtle, lineWidth: 1)
+        )
     }
 }
 
@@ -1293,6 +1740,16 @@ struct MeetingCardView: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(Theme.fg.opacity(0.45))
                     .padding(.leading, 2)
+                    .layoutPriority(1)
+
+                Spacer(minLength: 4)
+
+                if let folder = meeting.folder {
+                    Label(folder, systemImage: "folder.fill")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(Theme.fg.opacity(0.5))
+                        .lineLimit(1)
+                }
             }
             .padding(.top, 2)
         }
@@ -1338,6 +1795,7 @@ struct FilterPill: View {
     let title: String
     let count: Int
     let dotColor: Color?
+    var systemImage: String? = nil
     let isSelected: Bool
     let action: () -> Void
 
@@ -1348,6 +1806,10 @@ struct FilterPill: View {
                     Circle()
                         .fill(dotColor)
                         .frame(width: 6, height: 6)
+                }
+                if let systemImage {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 9.5))
                 }
 
                 Text(title)

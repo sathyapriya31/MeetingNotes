@@ -5,15 +5,19 @@ import Foundation
 @MainActor
 final class MeetingStore: ObservableObject {
     @Published private(set) var meetings: [Meeting] = []
+    /// Folder names, sorted. Kept in `folders.json` so empty folders survive a relaunch.
+    @Published private(set) var folders: [String] = []
 
     /// EmbeddingGemma-backed index used for "search by meaning" in the sidebar.
     let semanticSearch: SemanticSearchService
 
     private let directory: URL
+    private let foldersURL: URL
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         directory = base.appendingPathComponent("MeetingNotes/Meetings", isDirectory: true)
+        foldersURL = base.appendingPathComponent("MeetingNotes/folders.json")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         semanticSearch = SemanticSearchService(
             directory: base.appendingPathComponent("MeetingNotes", isDirectory: true)
@@ -36,6 +40,9 @@ final class MeetingStore: ObservableObject {
             .filter { $0.pathExtension == "json" }
             .compactMap { try? JSONDecoder().decode(Meeting.self, from: Data(contentsOf: $0)) }
             .sorted { $0.date > $1.date }
+        let saved = (try? JSONDecoder().decode([String].self, from: Data(contentsOf: foldersURL))) ?? []
+        // Also pick up folders referenced by meetings, in case folders.json was lost.
+        setFolders(saved + meetings.compactMap(\.folder))
         refreshSemanticIndex()
     }
 
@@ -101,6 +108,29 @@ final class MeetingStore: ObservableObject {
         update(meeting)
     }
 
+    func updateUserNotes(in meetingID: UUID, to text: String) {
+        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
+        var meeting = meetings[index]
+        let newValue = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+        guard meeting.userNotes != newValue else { return }
+        meeting.userNotes = newValue
+        update(meeting)
+    }
+
+    /// Saves a hand-edited summary and decisions (one decision per non-empty line).
+    func updateSummary(in meetingID: UUID, summary: String, decisions: String) {
+        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
+        var meeting = meetings[index]
+        var notes = meeting.notes ?? MeetingNotes(summary: "", keyDecisions: [], actionItems: [])
+        notes.summary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        notes.keyDecisions = decisions
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces.union(CharacterSet(charactersIn: "-•*"))) }
+            .filter { !$0.isEmpty }
+        meeting.notes = notes
+        update(meeting)
+    }
+
     func toggleActionItem(in meetingID: UUID, itemID: UUID) {
         guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
         var meeting = meetings[index]
@@ -115,6 +145,62 @@ final class MeetingStore: ObservableObject {
         }
         meeting.notes = notes
         update(meeting)
+    }
+
+    // MARK: Folders
+
+    /// Creates the folder if needed and returns its name (`nil` if `name` is blank).
+    @discardableResult
+    func createFolder(_ name: String) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        if let existing = folders.first(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            return existing
+        }
+        setFolders(folders + [trimmed])
+        return trimmed
+    }
+
+    func renameFolder(_ oldName: String, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, trimmed != oldName,
+              !folders.contains(where: { $0 != oldName && $0.caseInsensitiveCompare(trimmed) == .orderedSame })
+        else { return }
+        setFolders(folders.map { $0 == oldName ? trimmed : $0 })
+        for meeting in meetings where meeting.folder == oldName {
+            var updated = meeting
+            updated.folder = trimmed
+            update(updated)
+        }
+    }
+
+    /// Removes the folder; its meetings become unfiled (they are not deleted).
+    func deleteFolder(_ name: String) {
+        setFolders(folders.filter { $0 != name })
+        for meeting in meetings where meeting.folder == name {
+            var updated = meeting
+            updated.folder = nil
+            update(updated)
+        }
+    }
+
+    func moveMeeting(_ meetingID: UUID, toFolder folder: String?) {
+        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
+        var meeting = meetings[index]
+        meeting.folder = folder.flatMap { createFolder($0) }
+        update(meeting)
+    }
+
+    private func setFolders(_ names: [String]) {
+        var seen = Set<String>()
+        folders = names
+            .filter { seen.insert($0.lowercased()).inserted }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        do {
+            try JSONEncoder().encode(folders).write(to: foldersURL, options: .atomic)
+        } catch {
+            NSLog("MeetingStore: failed to save folders: \(error)")
+        }
     }
 
     func delete(_ meeting: Meeting) {

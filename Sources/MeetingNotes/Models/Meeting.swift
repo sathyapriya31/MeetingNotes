@@ -26,6 +26,10 @@ struct Meeting: Codable, Identifiable {
     var date: Date
     var transcript: [TranscriptSegment]
     var notes: MeetingNotes?
+    /// Name of the folder this meeting is filed in (`nil` = unfiled).
+    var folder: String? = nil
+    /// What the user typed in "My Notes", kept as written.
+    var userNotes: String? = nil
 
     var displayTitle: String {
         if let title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -62,6 +66,9 @@ struct MeetingNotes: Codable {
     var summary: String
     var keyDecisions: [String]
     var actionItems: [ActionItem]
+    /// The user's own notes rewritten by the LLM with details from the transcript,
+    /// one bullet per entry. `nil` when the user wrote no notes.
+    var enhancedNotes: [String]? = nil
 }
 
 struct ActionItem: Codable, Identifiable {

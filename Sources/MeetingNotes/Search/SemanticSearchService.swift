@@ -193,8 +193,14 @@ actor SemanticSearchService {
             var parts = [notes.summary]
             parts += notes.keyDecisions.map { "Decision: \($0)" }
             parts += notes.actionItems.map { "Action item: \($0.task)" }
+            parts += (notes.enhancedNotes ?? []).map { "Note: \($0)" }
             let text = parts.filter { !$0.isEmpty }.joined(separator: "\n")
             if !text.isEmpty { passages.append(text) }
+        }
+
+        if let userNotes = meeting.userNotes?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !userNotes.isEmpty {
+            passages.append(String(userNotes.prefix(chunkSize)))
         }
 
         var current = ""
