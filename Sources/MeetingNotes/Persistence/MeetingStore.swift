@@ -117,20 +117,6 @@ final class MeetingStore: ObservableObject {
         update(meeting)
     }
 
-    /// Saves a hand-edited summary and decisions (one decision per non-empty line).
-    func updateSummary(in meetingID: UUID, summary: String, decisions: String) {
-        guard let index = meetings.firstIndex(where: { $0.id == meetingID }) else { return }
-        var meeting = meetings[index]
-        var notes = meeting.notes ?? MeetingNotes(summary: "", keyDecisions: [], actionItems: [])
-        notes.summary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        notes.keyDecisions = decisions
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces.union(CharacterSet(charactersIn: "-•*"))) }
-            .filter { !$0.isEmpty }
-        meeting.notes = notes
-        update(meeting)
-    }
-
     /// Pinned meetings, newest first.
     var pinnedMeetings: [Meeting] {
         meetings.filter(\.isPinned)
@@ -186,13 +172,18 @@ final class MeetingStore: ObservableObject {
         }
     }
 
-    /// Removes the folder; its meetings become unfiled (they are not deleted).
-    func deleteFolder(_ name: String) {
+    /// Removes the folder. Its meetings are deleted too when `deletingMeetings`
+    /// is true; otherwise they are kept and become unfiled.
+    func deleteFolder(_ name: String, deletingMeetings: Bool) {
         setFolders(folders.filter { $0 != name })
         for meeting in meetings where meeting.folder == name {
-            var updated = meeting
-            updated.folder = nil
-            update(updated)
+            if deletingMeetings {
+                delete(meeting)
+            } else {
+                var updated = meeting
+                updated.folder = nil
+                update(updated)
+            }
         }
     }
 

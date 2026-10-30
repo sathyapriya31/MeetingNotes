@@ -12,17 +12,19 @@ import Tokenizers
 final class SummarizationService {
     // ~1.8 GB download, cached by MLX in Application Support.
     // Qwen2.5-7B-Instruct-4bit is a big quality jump on 16 GB+ machines.
-    private let modelID = "mlx-community/Qwen2.5-3B-Instruct-4bit"
-    private var container: ModelContainer?
-
-    func prepare() async throws -> ModelContainer {
-        if let container { return container }
-        // Use the HuggingFace convenience macro to load the model container.
-        let c = try await #huggingFaceLoadModelContainer(
-            configuration: ModelConfiguration(id: modelID)
+    private static let modelID = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+    private let model = SharedModelLoad<ModelContainer> { progress in
+        try await #huggingFaceLoadModelContainer(
+            configuration: ModelConfiguration(id: SummarizationService.modelID),
+            progressHandler: { progress($0.fractionCompleted) }
         )
-        container = c
-        return c
+    }
+
+    /// Downloads (first use) and loads the model; concurrent callers share one load.
+    /// `progress` receives the download fraction (0...1).
+    @discardableResult
+    func prepare(progress: (@Sendable (Double) -> Void)? = nil) async throws -> ModelContainer {
+        try await model.value(progress: progress)
     }
 
     /// `attendees` (from the calendar invite) are offered as action-item owners

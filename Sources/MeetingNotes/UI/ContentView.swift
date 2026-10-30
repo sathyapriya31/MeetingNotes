@@ -130,6 +130,7 @@ struct SettingsView: View {
 
 struct MenuBarView: View {
     @EnvironmentObject var coordinator: MeetingCoordinator
+    @EnvironmentObject var setup: ModelSetup
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -145,6 +146,15 @@ struct MenuBarView: View {
                 }
                 Text(coordinator.status)
                     .font(.system(size: 13, weight: .medium))
+            }
+            if !setup.isComplete {
+                Text(setup.hasFailure && !setup.isBusy
+                     ? "Model download failed — open Meeting Notes to retry."
+                     : setup.pendingDownloadMegabytes > 0
+                        ? "Downloading AI models… \(Int(setup.overallProgress * 100))%"
+                        : "Loading AI models…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
             if coordinator.isRecording {
                 Button("Stop & Summarize") { Task { await coordinator.stopMeeting() } }
@@ -176,6 +186,7 @@ struct MenuBarView: View {
 struct ContentView: View {
     @EnvironmentObject var coordinator: MeetingCoordinator
     @EnvironmentObject var store: MeetingStore
+    @EnvironmentObject var setup: ModelSetup
 
     @State private var selectedMeetingID: UUID?
     @AppStorage(AppAppearance.appearanceKey) private var appearance = AppAppearance.defaultValue
@@ -200,9 +211,6 @@ struct ContentView: View {
     @State private var folderPrompt: FolderPrompt? = nil
     @State private var folderNameText = ""
     @State private var folderToDelete: String? = nil
-    @State private var isEditingSummary = false
-    @State private var summaryDraft = ""
-    @State private var decisionsDraft = ""
 
     private enum InsightsTab { case insights, ask }
 
@@ -246,6 +254,22 @@ struct ContentView: View {
     private var meetingAttendees: [String] {
         if let meeting = selectedMeeting { return meeting.attendees ?? [] }
         return coordinator.calendarMeeting?.attendees ?? []
+    }
+
+    /// The selected meeting, or a snapshot of the one being recorded; nil when
+    /// there is nothing to export yet.
+    private var exportableMeeting: Meeting? {
+        if let meeting = selectedMeeting { return meeting }
+        guard coordinator.currentNotes != nil || !coordinator.liveTranscript.isEmpty else { return nil }
+        var live = Meeting(
+            title: coordinator.liveTitle.isEmpty ? nil : coordinator.liveTitle,
+            date: Date(),
+            transcript: coordinator.liveTranscript,
+            notes: coordinator.currentNotes
+        )
+        live.userNotes = coordinator.liveUserNotes
+        live.attendees = coordinator.calendarMeeting?.attendees
+        return live
     }
 
     private var currentTitle: String {
@@ -369,6 +393,13 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 1060, minHeight: 680)
+        .overlay {
+            if setup.showsSetupScreen {
+                SetupView()
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: setup.showsSetupScreen)
         .background(KeyWindowEnforcer())
         .onAppear {
             if selectedMeetingID == nil, let first = store.meetings.first {
@@ -386,9 +417,6 @@ struct ContentView: View {
             if coordinator.isRecording {
                 selectedMeetingID = nil
             }
-        }
-        .onChange(of: selectedMeetingID) {
-            isEditingSummary = false
         }
         .onChange(of: coordinator.lastSavedMeetingID) {
             if let id = coordinator.lastSavedMeetingID {
@@ -416,20 +444,47 @@ struct ContentView: View {
             get: { folderToDelete != nil },
             set: { if !$0 { folderToDelete = nil } }
         )) {
-            Button("Cancel", role: .cancel) { folderToDelete = nil }
-            Button("Delete Folder", role: .destructive) {
-                if let name = folderToDelete {
-                    if folderFilter == .named(name) { folderFilter = .all }
-                    store.deleteFolder(name)
+            let count = folderToDeleteMeetingCount
+            if count > 0 {
+                Button("Delete Folder & \(count) Meeting\(count == 1 ? "" : "s")", role: .destructive) {
+                    deleteFolder(deletingMeetings: true)
                 }
-                folderToDelete = nil
+                Button("Delete Folder Only") {
+                    deleteFolder(deletingMeetings: false)
+                }
+            } else {
+                Button("Delete Folder", role: .destructive) {
+                    deleteFolder(deletingMeetings: false)
+                }
             }
+            Button("Cancel", role: .cancel) { folderToDelete = nil }
         } message: {
-            Text("Meetings in this folder are kept and moved to Unfiled.")
+            let count = folderToDeleteMeetingCount
+            if count > 0 {
+                Text("This folder has \(count) meeting\(count == 1 ? "" : "s"). Delete \(count == 1 ? "it" : "them") with the folder (this can't be undone), or delete only the folder and move \(count == 1 ? "it" : "them") to Unfiled?")
+            } else {
+                Text("This folder is empty.")
+            }
         }
     }
 
     // MARK: - Folders
+
+    private var folderToDeleteMeetingCount: Int {
+        guard let name = folderToDelete else { return 0 }
+        return store.meetings.filter { $0.folder == name }.count
+    }
+
+    private func deleteFolder(deletingMeetings: Bool) {
+        guard let name = folderToDelete else { return }
+        folderToDelete = nil
+        if folderFilter == .named(name) { folderFilter = .all }
+        if deletingMeetings,
+           let selected = selectedMeeting, selected.folder == name {
+            selectedMeetingID = store.meetings.first(where: { $0.folder != name })?.id
+        }
+        store.deleteFolder(name, deletingMeetings: deletingMeetings)
+    }
 
     private var folderPromptIsRename: Bool {
         if case .rename = folderPrompt { return true }
@@ -817,6 +872,14 @@ struct ContentView: View {
 
             Spacer(minLength: 0)
 
+            if !setup.isComplete && !setup.showsSetupScreen {
+                ModelSetupStatusRow()
+                    .background(Theme.bgApp)
+                    .overlay(alignment: .top) {
+                        Divider().background(Theme.borderSubtle)
+                    }
+            }
+
             // Sidebar Footer: 🔒 100% Local AI (Voz & Who)   v2.4
             HStack(spacing: 6) {
                 Image(systemName: "lock.fill")
@@ -1188,6 +1251,27 @@ struct ContentView: View {
                         .background(Theme.fg.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
                     }
                     .buttonStyle(.plain)
+
+                    Menu {
+                        ForEach(MeetingExporter.Format.allCases, id: \.self) { format in
+                            Button(format.menuTitle) {
+                                if let meeting = exportableMeeting {
+                                    MeetingExporter.export(meeting, as: format)
+                                }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(Theme.fg.opacity(0.8))
+                            .frame(width: 24, height: 20)
+                            .background(Theme.fg.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .disabled(exportableMeeting == nil)
+                    .help("Export summary and notes as PDF or Word")
                 }
             }
             .padding(.horizontal, 16)
@@ -1279,6 +1363,11 @@ struct ContentView: View {
             Menu("Move to Folder") {
                 folderMenuItems(for: meeting)
             }
+            Menu("Export") {
+                ForEach(MeetingExporter.Format.allCases, id: \.self) { format in
+                    Button(format.menuTitle) { MeetingExporter.export(meeting, as: format) }
+                }
+            }
             Divider()
             Button("Delete", role: .destructive) {
                 if selectedMeetingID == meeting.id {
@@ -1332,42 +1421,12 @@ struct ContentView: View {
 
                 Spacer()
 
-                if let meeting = selectedMeeting, !isEditingSummary {
-                    Button {
-                        summaryDraft = meeting.notes?.summary ?? ""
-                        decisionsDraft = (meeting.notes?.keyDecisions ?? []).joined(separator: "\n")
-                        isEditingSummary = true
-                    } label: {
-                        Label("Edit", systemImage: "pencil")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(Theme.fg.opacity(0.6))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Edit the summary and key decisions")
-                } else if !isEditingSummary {
-                    Text("Qwen 2.5 • 3B")
-                        .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(Theme.fg.opacity(0.4))
-                }
+                Text("Qwen 2.5 • 3B")
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(Theme.fg.opacity(0.4))
             }
 
-            if isEditingSummary, let meeting = selectedMeeting {
-                NotesTextEditor(text: $summaryDraft, placeholder: "Summary", height: 130)
-                Text("Key decisions — one per line")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(Theme.fg.opacity(0.5))
-                NotesTextEditor(text: $decisionsDraft, placeholder: "e.g. Ship v2 on Friday", height: 90)
-                HStack {
-                    Button("Cancel") { isEditingSummary = false }
-                    Spacer()
-                    Button("Save") {
-                        store.updateSummary(in: meeting.id, summary: summaryDraft, decisions: decisionsDraft)
-                        isEditingSummary = false
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-                .controlSize(.small)
-            } else if let summary = notes?.summary, !summary.isEmpty {
+            if let summary = notes?.summary, !summary.isEmpty {
                 // Paragraph
                 Text(summary)
                     .font(.system(size: 12.5))
@@ -1611,7 +1670,7 @@ struct ContentView: View {
 
 /// The user's own notes. For the live meeting it edits `coordinator.liveUserNotes`
 /// (they steer the summary on Stop); for a saved meeting it edits a draft that is
-/// saved after a short pause, and offers "Improve with AI" to regenerate the notes.
+/// saved after a short pause.
 struct MyNotesCard: View {
     @EnvironmentObject var coordinator: MeetingCoordinator
     @EnvironmentObject var store: MeetingStore
@@ -1620,10 +1679,6 @@ struct MyNotesCard: View {
     let meeting: Meeting?
 
     @State private var draft = ""
-
-    private var isImproving: Bool {
-        meeting != nil && coordinator.improvingMeetingID == meeting?.id
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1638,41 +1693,13 @@ struct MyNotesCard: View {
                 }
 
                 Spacer()
-
-                if let meeting {
-                    Button {
-                        save()
-                        Task { await coordinator.improveNotes(for: meeting.id) }
-                    } label: {
-                        HStack(spacing: 4) {
-                            if isImproving {
-                                ProgressView()
-                                    .controlSize(.mini)
-                            } else {
-                                Image(systemName: "sparkles")
-                                    .font(.system(size: 10))
-                            }
-                            Text(isImproving ? "Improving…" : "Improve with AI")
-                                .font(.system(size: 10.5, weight: .semibold))
-                        }
-                        .foregroundStyle(Theme.primaryBlue)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Theme.primaryBlue.opacity(0.12), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(coordinator.isRecording || coordinator.improvingMeetingID != nil || meeting.transcript.isEmpty)
-                    .help(coordinator.isRecording
-                          ? "Available after the current recording stops"
-                          : "Rewrite the summary, decisions, action items and enhanced notes using your notes")
-                }
             }
 
             NotesTextEditor(
                 text: meeting == nil ? $coordinator.liveUserNotes : $draft,
                 placeholder: meeting == nil
                     ? "Jot down key points as the meeting goes — names, numbers, things to follow up…"
-                    : "Add your own notes, then Improve with AI to fold them into the summary.",
+                    : "Add your own notes about this meeting…",
                 height: 120
             )
 
@@ -1682,10 +1709,6 @@ struct MyNotesCard: View {
                      : "You can start typing before you press New Recording.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(Theme.fg.opacity(0.4))
-            } else if let error = coordinator.improveError, coordinator.improvingMeetingID == nil {
-                Text(error)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(Color.orange)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1697,7 +1720,6 @@ struct MyNotesCard: View {
         )
         .onAppear {
             draft = meeting?.userNotes ?? ""
-            coordinator.improveError = nil
         }
         .task(id: draft) {
             // Debounce: each save rewrites the meeting file and re-embeds it for search.

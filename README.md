@@ -25,6 +25,9 @@ desert-ant-core (Voz/Who) require Apple Silicon.)
   event, the meeting takes the event's title, shows its attendees, and names the
   remote speakers after them (see *Speaker names from the calendar*). Read-only;
   can be turned off in Settings.
+- **Export:** save a meeting's summary, notes, key decisions, action items and
+  transcript as **PDF** or **Word (.docx)**: use the share icon in the AI Meeting
+  Insights header, or right-click a meeting → Export.
 - **Search & Ask:** search past meetings by keyword or meaning, and ask questions
   answered from your own meeting notes.
 - **Appearance:** Light, Dark or System (⌘, or the icon in the window header).
@@ -77,10 +80,12 @@ the meeting ends.
 | Transcription (Voz) | `Transcription/TranscriptionService.swift` |
 | Dedup | `Transcription/TranscriptDeduplicator.swift` |
 | Diarization (Who) | `Diarization/DiarizationService.swift` |
+| Model download & preload (setup screen) | `Setup/ModelSetup.swift`, `UI/SetupView.swift` |
 | Calendar match (EventKit) | `Calendar/CalendarService.swift` |
 | Speaker names from attendees | `Diarization/SpeakerLabeler.swift` |
 | Summary, action items, Ask answers (Qwen) | `Summarization/SummarizationService.swift` |
 | Persistence | `Persistence/MeetingStore.swift` |
+| PDF / Word export | `Export/MeetingExporter.swift` |
 | Semantic index & search (EmbeddingGemma) | `Search/SemanticSearchService.swift` |
 | Orchestration | `App.swift` (`MeetingCoordinator`) |
 
@@ -112,8 +117,13 @@ open MeetingNotes.app
   Every rebuild changes the signature, so macOS asks for **Microphone** and
   **System Audio Recording** access again on the next recording.
 - The main window opens from the menu-bar icon → **Open Meeting Notes**.
-- The first recording after launch takes up to about a minute while the models
-  load (the window shows a loading state); later recordings start almost at once.
+- **First run:** the app opens a setup screen that downloads the models (about
+  2.3 GB) with per-model and overall progress. It can be dismissed with
+  *Continue in Background*; progress then shows at the bottom of the sidebar
+  (click it to reopen the screen). Failed downloads retry automatically, then
+  offer *Retry*.
+- **Every launch:** all models are preloaded in the background (speech models
+  first), so recordings start at once instead of waiting up to a minute.
 
 ## Project setup (Xcode alternative)
 

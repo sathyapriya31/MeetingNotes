@@ -7,18 +7,22 @@ import Who
 /// and segments it into distinct speaker turns with millisecond timestamps.
 final class DiarizationService {
     private let who = Who()
+    private var isWarmedUp = false
 
     /// Prepares the Who model and pre-warms the Neural Engine graphs so post-meeting
     /// diarization runs in near-realtime (~1-2 seconds) rather than compiling on stop.
-    func prepare() async throws {
+    /// `progress` receives the download fraction (0...1).
+    func prepare(progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws {
+        guard !isWarmedUp else { return }
         if !who.isDownloaded() {
-            try await who.download()
+            try await who.download(progress: progress)
         }
         // Pre-warm the 5 Core ML graphs ahead of time with a 1-second sample
         _ = try? await who.diarize(
             samples: [Float](repeating: 0, count: 16_000),
             sampleRate: 16_000.0
         )
+        isWarmedUp = true
     }
 
     func diarize(
