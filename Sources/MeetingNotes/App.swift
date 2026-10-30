@@ -23,13 +23,9 @@ struct MeetingNotesApp: App {
     @StateObject private var coordinator = MeetingCoordinator()
 
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra("MeetingNotes", systemImage: coordinator.isRecording ? "record.circle.fill" : "waveform") {
             MenuBarView()
                 .environmentObject(coordinator)
-                .environmentObject(coordinator.setup)
-        } label: {
-            MenuBarIcon(isRecording: coordinator.isRecording,
-                        needsSetup: coordinator.setup.showsSetupScreen)
         }
         .menuBarExtraStyle(.window)
 
@@ -37,7 +33,6 @@ struct MeetingNotesApp: App {
             ContentView()
                 .environmentObject(coordinator)
                 .environmentObject(coordinator.store)
-                .environmentObject(coordinator.setup)
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -68,24 +63,6 @@ struct MeetingNotesApp: App {
     }
 }
 
-/// The menu bar icon. Its view exists from launch (unlike the main window), so
-/// it also opens the main window on first run to show the model setup screen.
-struct MenuBarIcon: View {
-    let isRecording: Bool
-    let needsSetup: Bool
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        Image(systemName: isRecording ? "record.circle.fill" : "waveform")
-            .task {
-                guard needsSetup else { return }
-                NSApp.setActivationPolicy(.regular)
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "main")
-            }
-    }
-}
-
 /// Orchestrates the whole pipeline:
 /// capture → transcribe (live) → diarize (post) → summarize (post).
 @MainActor
@@ -110,8 +87,6 @@ final class MeetingCoordinator: ObservableObject {
     @Published var calendarMeeting: CalendarMeeting?
 
     let store = MeetingStore()
-    /// Download / load progress of the on-device models (first-run setup screen).
-    let setup = ModelSetup()
     private var meetingStart: Date?
     private var timerTask: Task<Void, Never>?
 
@@ -122,32 +97,6 @@ final class MeetingCoordinator: ObservableObject {
     private let summarizer = SummarizationService()
     private let calendar = CalendarService()
     private let vad = VoiceActivityDetector()
-    /// Launch-time load of Voz + Who; Start waits on it instead of loading twice.
-    private var speechPreload: Task<Void, Never>?
-
-    init() {
-        preloadModels()
-    }
-
-    /// Downloads (first run) and loads every model in the background so the first
-    /// recording starts at once and the first summary/search doesn't stall.
-    /// Speech models go first: they are what Start needs. Safe to call again
-    /// (e.g. Retry); models that are already loaded are skipped.
-    func preloadModels() {
-        guard !setup.isBusy else { return }
-        let speech = Task { [weak self] in
-            guard let self else { return }
-            await self.setup.run(.voz) { progress in try await self.transcriber.prepare(progress: progress) }
-            await self.setup.run(.who) { progress in try await self.diarizer.prepare(progress: progress) }
-        }
-        speechPreload = speech
-        Task { [weak self] in
-            await speech.value
-            guard let self else { return }
-            await self.setup.run(.qwen) { progress in try await self.summarizer.prepare(progress: progress) }
-            await self.setup.run(.gemma) { progress in try await self.store.semanticSearch.preload(progress: progress) }
-        }
-    }
 
     // Raw 16 kHz mono buffers kept for post-meeting diarization.
     private var micSamples: [Float] = []
@@ -176,9 +125,6 @@ final class MeetingCoordinator: ObservableObject {
         }
 
         status = "Loading speech recognition (Voz)…"
-        // On launch the models are already loading; wait for that rather than
-        // starting a second load of the same model.
-        await speechPreload?.value
         do {
             try await transcriber.prepare()
             status = "Loading speaker diarization (Who)…"

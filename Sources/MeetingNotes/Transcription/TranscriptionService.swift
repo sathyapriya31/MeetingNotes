@@ -57,11 +57,10 @@ final class TranscriptionService {
     private let sampleRate: Double = 16_000
 
     /// Loads the Voz model on the Apple Neural Engine, downloading it if not present.
-    /// `progress` receives the download fraction (0...1).
-    func prepare(progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws {
+    func prepare() async throws {
         guard voz == nil else { return }
         if !Voz.isDownloaded() {
-            try await Voz.download(progress: { progress($0.fraction) })
+            try await Voz.download()
         }
         voz = try await Voz()
     }

@@ -15,7 +15,7 @@ import Tokenizers
 actor SemanticSearchService {
     // ~330 MB download, cached by the Hugging Face hub client like the LLM.
     // The 4-bit variant is ~half the size with slightly weaker retrieval.
-    private static let modelID = "mlx-community/embeddinggemma-300m-8bit"
+    private let modelID = "mlx-community/embeddinggemma-300m-8bit"
 
     /// Passages longer than this are truncated. EmbeddingGemma supports 2,048,
     /// but shorter inputs keep indexing fast and passages are already small.
@@ -23,14 +23,7 @@ actor SemanticSearchService {
     private let maxPassagesPerMeeting = 60
     private let passageCharacters = 1_200
 
-    private let model = SharedModelLoad<EmbedderModelContainer> { progress in
-        try await EmbedderModelFactory.shared.loadContainer(
-            from: #hubDownloader(),
-            using: #huggingFaceTokenizerLoader(),
-            configuration: ModelConfiguration(id: SemanticSearchService.modelID),
-            progressHandler: { progress($0.fractionCompleted) }
-        )
-    }
+    private var container: EmbedderModelContainer?
     private var index: [UUID: IndexedMeeting] = [:]
     private var isIndexing = false
     private var needsAnotherPass: [Meeting]?
@@ -160,14 +153,15 @@ actor SemanticSearchService {
 
     // MARK: - Model
 
-    /// Downloads (first use) and loads the embedding model ahead of the first search.
-    /// `progress` receives the download fraction (0...1).
-    func preload(progress: @escaping @Sendable (Double) -> Void) async throws {
-        _ = try await model.value(progress: progress)
-    }
-
     private func prepare() async throws -> EmbedderModelContainer {
-        try await model.value()
+        if let container { return container }
+        let c = try await EmbedderModelFactory.shared.loadContainer(
+            from: #hubDownloader(),
+            using: #huggingFaceTokenizerLoader(),
+            configuration: ModelConfiguration(id: modelID)
+        )
+        container = c
+        return c
     }
 
     /// Embeds one text. Inputs are embedded one at a time (no padding) because the

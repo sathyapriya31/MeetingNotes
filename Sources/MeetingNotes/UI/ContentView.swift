@@ -130,7 +130,6 @@ struct SettingsView: View {
 
 struct MenuBarView: View {
     @EnvironmentObject var coordinator: MeetingCoordinator
-    @EnvironmentObject var setup: ModelSetup
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -146,15 +145,6 @@ struct MenuBarView: View {
                 }
                 Text(coordinator.status)
                     .font(.system(size: 13, weight: .medium))
-            }
-            if !setup.isComplete {
-                Text(setup.hasFailure && !setup.isBusy
-                     ? "Model download failed — open Meeting Notes to retry."
-                     : setup.pendingDownloadMegabytes > 0
-                        ? "Downloading AI models… \(Int(setup.overallProgress * 100))%"
-                        : "Loading AI models…")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
             }
             if coordinator.isRecording {
                 Button("Stop & Summarize") { Task { await coordinator.stopMeeting() } }
@@ -186,7 +176,6 @@ struct MenuBarView: View {
 struct ContentView: View {
     @EnvironmentObject var coordinator: MeetingCoordinator
     @EnvironmentObject var store: MeetingStore
-    @EnvironmentObject var setup: ModelSetup
 
     @State private var selectedMeetingID: UUID?
     @AppStorage(AppAppearance.appearanceKey) private var appearance = AppAppearance.defaultValue
@@ -393,13 +382,6 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 1060, minHeight: 680)
-        .overlay {
-            if setup.showsSetupScreen {
-                SetupView()
-                    .transition(.opacity)
-            }
-        }
-        .animation(.easeInOut(duration: 0.2), value: setup.showsSetupScreen)
         .background(KeyWindowEnforcer())
         .onAppear {
             if selectedMeetingID == nil, let first = store.meetings.first {
@@ -871,14 +853,6 @@ struct ContentView: View {
             }
 
             Spacer(minLength: 0)
-
-            if !setup.isComplete && !setup.showsSetupScreen {
-                ModelSetupStatusRow()
-                    .background(Theme.bgApp)
-                    .overlay(alignment: .top) {
-                        Divider().background(Theme.borderSubtle)
-                    }
-            }
 
             // Sidebar Footer: 🔒 100% Local AI (Voz & Who)   v2.4
             HStack(spacing: 6) {
