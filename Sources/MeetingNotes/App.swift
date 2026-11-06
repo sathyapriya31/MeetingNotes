@@ -1,8 +1,25 @@
 import SwiftUI
+import AppKit
 import AVFoundation
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let stored = UserDefaults.standard.string(forKey: AppAppearance.appearanceKey)
+        (stored.flatMap(AppAppearance.init(rawValue:)) ?? AppAppearance.defaultValue).apply()
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        return true
+    }
+}
 
 @main
 struct MeetingNotesApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var coordinator = MeetingCoordinator()
 
     var body: some Scene {
@@ -17,6 +34,32 @@ struct MeetingNotesApp: App {
                 .environmentObject(coordinator)
                 .environmentObject(coordinator.store)
         }
+        .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandMenu("Recording") {
+                // A menu key equivalent works whenever the app is active, unlike a
+                // view-level .keyboardShortcut that needs its window to be key.
+                Button(coordinator.isRecording ? "Stop & Summarize"
+                       : coordinator.isPreparing ? "Loading Models…" : "Start Recording") {
+                    Task {
+                        if coordinator.isRecording {
+                            await coordinator.stopMeeting()
+                        } else {
+                            await coordinator.startMeeting()
+                        }
+                    }
+                }
+                .keyboardShortcut("n", modifiers: [.option])
+                .disabled(coordinator.isPreparing)
+
+                Button(coordinator.isPaused ? "Resume" : "Pause") { coordinator.togglePause() }
+                    .disabled(!coordinator.isRecording)
+            }
+        }
+
+        Settings {
+            SettingsView()
+        }
     }
 }
 
@@ -25,26 +68,50 @@ struct MeetingNotesApp: App {
 @MainActor
 final class MeetingCoordinator: ObservableObject {
     @Published var isRecording = false
+    @Published var isPaused = false
+    @Published var recordingDuration: TimeInterval = 0
     @Published var liveTranscript: [TranscriptSegment] = []
     @Published var currentNotes: MeetingNotes?
     @Published var status: String = "Idle"
     @Published var lastSavedMeetingID: UUID?
+    /// Title typed for the meeting in progress; empty = derive one from the summary.
+    @Published var liveTitle = ""
+    /// "My Notes" for the meeting in progress. Can be typed before Start; cleared
+    /// once the meeting is saved.
+    @Published var liveUserNotes = ""
+    /// True while models load after Start, before capture actually begins.
+    @Published var isPreparing = false
+    /// Why the last start attempt failed (shown in the main window), if it did.
+    @Published var startError: String?
+    /// The calendar event matched to the meeting in progress, if any.
+    @Published var calendarMeeting: CalendarMeeting?
 
     let store = MeetingStore()
     private var meetingStart: Date?
+    private var timerTask: Task<Void, Never>?
 
     private let mic = MicCapture()
     private let systemTap = SystemAudioTap()
     private let transcriber = TranscriptionService()
     private let diarizer = DiarizationService()
     private let summarizer = SummarizationService()
+    private let calendar = CalendarService()
+    private let vad = VoiceActivityDetector()
 
     // Raw 16 kHz mono buffers kept for post-meeting diarization.
     private var micSamples: [Float] = []
     private var systemSamples: [Float] = []
 
+    func togglePause() {
+        guard isRecording else { return }
+        isPaused.toggle()
+    }
+
     func startMeeting() async {
-        guard !isRecording else { return }
+        guard !isRecording, !isPreparing else { return }
+        isPreparing = true
+        startError = nil
+        defer { isPreparing = false }
 
         // Ask for mic access before touching AVAudioEngine — with access not
         // yet granted the input node reports an invalid HW format and CoreAudio
@@ -53,17 +120,47 @@ final class MeetingCoordinator: ObservableObject {
         let granted = await AVCaptureDevice.requestAccess(for: .audio)
         guard granted else {
             status = "Microphone access denied — enable it in System Settings → Privacy & Security → Microphone."
+            startError = status
             return
         }
 
-        status = "Loading models…"
+        status = "Loading speech recognition (Voz)…"
         do {
-            try await transcriber.prepare()   // downloads Whisper on first run
+            try await transcriber.prepare()
+            status = "Loading speaker diarization (Who)…"
+            try await diarizer.prepare()
             status = "Recording"
             isRecording = true
+            isPaused = false
+            recordingDuration = 0
             meetingStart = Date()
             micSamples.removeAll(); systemSamples.removeAll()
             liveTranscript.removeAll(); currentNotes = nil
+            liveTitle = ""
+            calendarMeeting = nil
+            vad.reset()
+
+            liveSummaryTask?.cancel()
+            liveSummaryTask = nil
+            lastLiveSummarizedCount = 0
+            lastLiveSummaryAt = .distantPast
+            timerTask?.cancel()
+            timerTask = Task { @MainActor [weak self] in
+                while let self = self, self.isRecording {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if !self.isPaused {
+                        self.recordingDuration += 1
+                    }
+                }
+            }
+
+            transcriber.start { [weak self] segment in
+                Task { @MainActor in
+                    guard let self, self.isRecording else { return }
+                    self.liveTranscript.append(segment)
+                    self.triggerLiveSummarization()
+                }
+            }
 
             // Two channels: mic = "You", system tap = "Them".
             try mic.start { [weak self] samples in
@@ -72,32 +169,101 @@ final class MeetingCoordinator: ObservableObject {
             try systemTap.start { [weak self] samples in
                 Task { @MainActor in self?.ingest(samples, channel: .system) }
             }
+
+            // Match the calendar event (title + attendees) without delaying capture.
+            let started = meetingStart ?? Date()
+            Task { [weak self, calendar] in
+                let match = await calendar.meeting(around: started)
+                guard let self, self.isRecording, let match else { return }
+                self.calendarMeeting = match
+                if self.liveTitle.isEmpty, !match.title.isEmpty {
+                    self.liveTitle = match.title
+                }
+            }
+
+            // Pre-warm the local LLM in the background so it's instant when stopping
+            Task.detached(priority: .utility) { [weak self] in
+                _ = try? await self?.summarizer.prepare()
+            }
         } catch {
+            print("MeetingCoordinator start error: \(error)")
             status = "Failed to start: \(error.localizedDescription)"
+            startError = status
             isRecording = false
+            timerTask?.cancel()
+            timerTask = nil
+            // The mic may already be running if the system tap failed.
+            mic.stop(); systemTap.stop()
+            _ = await transcriber.finish()
         }
     }
+
+    private var liveSummaryTask: Task<Void, Never>?
+    private var lastLiveSummarizedCount = 0
+    private var lastLiveSummaryAt = Date.distantPast
+    /// Live summaries rerun the LLM over the whole transcript, so keep them sparse.
+    private let liveSummaryMinInterval: TimeInterval = 45
+    private let liveSummaryMinNewSegments = 4
 
     private func ingest(_ samples: [Float], channel: AudioChannel) {
+        guard !isPaused else { return }
         switch channel {
-        case .mic: micSamples.append(contentsOf: samples)
-        case .system: systemSamples.append(contentsOf: samples)
-        }
-        transcriber.feed(samples, channel: channel) { [weak self] segment in
-            Task { @MainActor in self?.liveTranscript.append(segment) }
+        case .mic:
+            micSamples.append(contentsOf: samples)
+            // Mic frames that are only speaker bleed-through are replaced with
+            // silence (not dropped) so the mic timeline stays aligned.
+            let speaking = vad.isUserSpeaking(micSamples: samples)
+            transcriber.feed(speaking ? samples : [Float](repeating: 0, count: samples.count), channel: .mic)
+        case .system:
+            systemSamples.append(contentsOf: samples)
+            vad.feedSystem(samples)
+            transcriber.feed(samples, channel: .system)
         }
     }
 
-    func stopMeeting() async {
+    private func triggerLiveSummarization() {
+        guard isRecording, liveSummaryTask == nil else { return }
+        let count = liveTranscript.count
+        guard count - lastLiveSummarizedCount >= liveSummaryMinNewSegments,
+              Date().timeIntervalSince(lastLiveSummaryAt) >= liveSummaryMinInterval else { return }
+        lastLiveSummaryAt = Date()
+        let snapshot = liveTranscript
+        let userNotes = liveUserNotes
+
+        liveSummaryTask = Task { [weak self, summarizer] in
+            let notes = try? await summarizer.summarize(transcript: snapshot, userNotes: userNotes)
+            guard let self else { return }
+            self.liveSummaryTask = nil
+            // A result arriving after Stop is stale — the final summary owns currentNotes.
+            guard !Task.isCancelled, self.isRecording, let notes else { return }
+            self.currentNotes = notes
+            self.lastLiveSummarizedCount = count
+        }
+    }
+
+    func stopMeeting(customTitle: String? = nil) async {
         guard isRecording else { return }
+        timerTask?.cancel()
+        timerTask = nil
         mic.stop(); systemTap.stop()
         isRecording = false
+        isPaused = false
+        liveSummaryTask?.cancel()
+        liveSummaryTask = nil
 
         status = "Finalizing transcript…"
         let finalSegments = await transcriber.finish()
-        liveTranscript = finalSegments.sorted { $0.start < $1.start }
+        liveTranscript = TranscriptDeduplicator.deduplicate(finalSegments.sorted { $0.start < $1.start })
 
-        status = "Identifying speakers…"
+        // Nothing was said: don't diarize or summarize (the LLM would invent a
+        // meeting from an empty prompt), and drop any live notes.
+        guard !liveTranscript.isEmpty else {
+            currentNotes = nil
+            status = "No speech captured — nothing was saved."
+            return
+        }
+
+        status = "Identifying speakers (Who)…"
         let diarized = await diarizer.diarize(
             micSamples: micSamples,
             systemSamples: systemSamples,
@@ -105,9 +271,18 @@ final class MeetingCoordinator: ObservableObject {
         )
         liveTranscript = diarized
 
+        let attendees = calendarMeeting?.attendees ?? []
+        if !attendees.isEmpty {
+            liveTranscript = await labelSpeakers(liveTranscript, attendees: attendees)
+        }
+
         status = "Summarizing on-device…"
         do {
-            currentNotes = try await summarizer.summarize(transcript: diarized)
+            currentNotes = try await summarizer.summarize(
+                transcript: liveTranscript,
+                attendees: attendees,
+                userNotes: liveUserNotes
+            )
             status = "Done"
         } catch {
             status = "Summarization failed: \(error.localizedDescription)"
@@ -117,11 +292,100 @@ final class MeetingCoordinator: ObservableObject {
         // still useful. Once saved, the store owns it: clear the live state and
         // let the UI switch to the saved copy.
         if !liveTranscript.isEmpty {
-            let meeting = Meeting(date: meetingStart ?? Date(), transcript: liveTranscript, notes: currentNotes)
+            var meeting = Meeting(date: meetingStart ?? Date(), transcript: liveTranscript, notes: currentNotes)
+            let title = (customTitle ?? liveTitle).trimmingCharacters(in: .whitespaces)
+            if !title.isEmpty {
+                meeting.title = title
+            }
+            let userNotes = liveUserNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+            meeting.userNotes = userNotes.isEmpty ? nil : liveUserNotes
+            if let calendarMeeting {
+                meeting.attendees = calendarMeeting.attendees
+                meeting.calendarEventID = calendarMeeting.eventID
+            }
             store.save(meeting)
             liveTranscript = []
             currentNotes = nil
+            liveUserNotes = ""
+            calendarMeeting = nil
             lastSavedMeetingID = meeting.id
+        }
+    }
+
+    /// Names remote speakers after calendar attendees (see `SpeakerLabeler`).
+    private func labelSpeakers(_ segments: [TranscriptSegment], attendees: [String]) async -> [TranscriptSegment] {
+        let labels = SpeakerLabeler.remoteLabels(in: segments)
+        if let direct = SpeakerLabeler.directMapping(labels: labels, attendees: attendees) {
+            return SpeakerLabeler.apply(direct, to: segments)
+        }
+        guard SpeakerLabeler.needsInference(labels: labels, attendees: attendees) else { return segments }
+        status = "Matching speakers to attendees…"
+        do {
+            let proposal = try await summarizer.inferSpeakerNames(
+                transcript: segments, labels: labels.filter { $0 != "Them" }, attendees: attendees)
+            let mapping = SpeakerLabeler.validatedMapping(proposal, labels: labels, attendees: attendees)
+            return SpeakerLabeler.apply(mapping, to: segments)
+        } catch {
+            print("Speaker naming failed, keeping diarization labels: \(error)")
+            return segments
+        }
+    }
+
+    func renameLiveSpeaker(from oldName: String, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        liveTranscript = liveTranscript.map { seg in
+            if seg.speaker == oldName {
+                var s = seg
+                s.speaker = trimmed
+                return s
+            }
+            return seg
+        }
+    }
+
+    // MARK: - Ask your meetings
+
+    /// Answers a question about past meetings: EmbeddingGemma retrieves the most
+    /// relevant excerpts, then the local LLM answers from those excerpts only.
+    func ask(_ question: String) async throws -> MeetingAnswer {
+        let passages = try await store.semanticSearch.topPassages(for: question, limit: 6, minScore: 0.3)
+        let meetingsByID = Dictionary(uniqueKeysWithValues: store.meetings.map { ($0.id, $0) })
+        let usable = passages.filter { meetingsByID[$0.meetingID] != nil }
+
+        guard !usable.isEmpty else {
+            return MeetingAnswer(
+                text: "I couldn't find anything about that in your meetings. "
+                    + "If you just recorded or opened the app, indexing may still be running — try again in a moment.",
+                excerptMeetingIDs: []
+            )
+        }
+
+        let excerpts = usable.map { passage in
+            let meeting = meetingsByID[passage.meetingID]!
+            let source = "\(meeting.displayTitle), \(meeting.date.formatted(date: .abbreviated, time: .omitted))"
+            return (source: source, text: passage.text)
+        }
+        let text = try await summarizer.answer(question: question, excerpts: excerpts)
+        return MeetingAnswer(text: text, excerptMeetingIDs: usable.map(\.meetingID))
+    }
+}
+
+struct MeetingAnswer {
+    let text: String
+    /// Meeting behind each excerpt given to the LLM; index i is citation [i + 1].
+    let excerptMeetingIDs: [UUID]
+
+    /// Citation number and meeting for each source to show, one per meeting.
+    /// Uses the citations the model wrote; falls back to every excerpt if it wrote none.
+    var sources: [(number: Int, meetingID: UUID)] {
+        let cited = text.matches(of: #/\[(\d+)\]/#).compactMap { Int($0.1) }
+        let numbers = cited.isEmpty ? Array(excerptMeetingIDs.indices.map { $0 + 1 }) : cited
+        var seenMeetings = Set<UUID>()
+        return numbers.compactMap { n in
+            guard excerptMeetingIDs.indices.contains(n - 1) else { return nil }
+            let id = excerptMeetingIDs[n - 1]
+            return seenMeetings.insert(id).inserted ? (n, id) : nil
         }
     }
 }

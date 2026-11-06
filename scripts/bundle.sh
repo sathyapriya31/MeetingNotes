@@ -46,6 +46,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Records your side of the meeting.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Uses your calendar event's title and attendees to name meetings and speakers. Read-only.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Uses your calendar event's title and attendees to name meetings and speakers. Read-only.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Records meeting audio from other apps (Zoom, Meet, Teams).</string>
 </dict>
