@@ -10,6 +10,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Quitting mid-recording or mid-summarizing would silently lose the meeting:
+    /// offer to finish saving it first.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let coordinator = MeetingCoordinator.shared,
+              coordinator.isRecording || coordinator.isProcessing else { return .terminateNow }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if coordinator.isRecording {
+            alert.messageText = "A meeting is still being recorded"
+            alert.informativeText = "Stop and save it before quitting? Saving runs the transcript and summary on-device and can take up to a minute."
+        } else {
+            alert.messageText = "A meeting is still being saved"
+            alert.informativeText = "MeetingNotes is finishing the transcript and summary. Wait for it to be saved before quitting?"
+        }
+        alert.addButton(withTitle: coordinator.isRecording ? "Save & Quit" : "Wait & Quit")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Quit Without Saving")
+        NSApp.activate(ignoringOtherApps: true)
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            Task { @MainActor in
+                await coordinator.finishForQuit()
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
+        case .alertThirdButtonReturn:
+            return .terminateNow
+        default:
+            return .terminateCancel
+        }
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -40,7 +74,8 @@ struct MeetingNotesApp: App {
                 // A menu key equivalent works whenever the app is active, unlike a
                 // view-level .keyboardShortcut that needs its window to be key.
                 Button(coordinator.isRecording ? "Stop & Summarize"
-                       : coordinator.isPreparing ? "Loading Models…" : "Start Recording") {
+                       : coordinator.isPreparing ? "Loading Models…"
+                       : coordinator.isProcessing ? "Saving Meeting…" : "Start Recording") {
                     Task {
                         if coordinator.isRecording {
                             await coordinator.stopMeeting()
@@ -50,7 +85,7 @@ struct MeetingNotesApp: App {
                     }
                 }
                 .keyboardShortcut("n", modifiers: [.option])
-                .disabled(coordinator.isPreparing)
+                .disabled(coordinator.isPreparing || coordinator.isProcessing)
 
                 Button(coordinator.isPaused ? "Resume" : "Pause") { coordinator.togglePause() }
                     .disabled(!coordinator.isRecording)
@@ -83,8 +118,30 @@ final class MeetingCoordinator: ObservableObject {
     @Published var isPreparing = false
     /// Why the last start attempt failed (shown in the main window), if it did.
     @Published var startError: String?
+    /// True when the last start failed because microphone access is denied, so
+    /// the UI can offer to open the Microphone privacy settings.
+    @Published var microphoneAccessDenied = false
     /// The calendar event matched to the meeting in progress, if any.
     @Published var calendarMeeting: CalendarMeeting?
+    /// True from Stop until the meeting is saved (finalize → diarize → summarize).
+    /// A new recording can't start meanwhile: it would reset the state being saved.
+    @Published private(set) var isProcessing = false
+    /// Shown in the main window after a Stop that saved nothing (e.g. no speech).
+    @Published var stopNotice: String?
+    /// Saved meetings whose AI notes are being regenerated.
+    @Published private(set) var regeneratingMeetingIDs: Set<UUID> = []
+    /// Why the last "Retry summary" failed, per meeting.
+    @Published private(set) var regenerateErrors: [UUID: String] = [:]
+
+    /// The app's single coordinator, for AppKit callbacks (quit confirmation).
+    private(set) static weak var shared: MeetingCoordinator?
+
+    init() {
+        Self.shared = self
+    }
+
+    /// True while starting, recording or saving — anything a new recording would clobber.
+    var isBusy: Bool { isPreparing || isRecording || isProcessing }
 
     let store = MeetingStore()
     private var meetingStart: Date?
@@ -108,19 +165,33 @@ final class MeetingCoordinator: ObservableObject {
     }
 
     func startMeeting() async {
-        guard !isRecording, !isPreparing else { return }
+        guard !isRecording, !isPreparing, !isProcessing else { return }
         isPreparing = true
         startError = nil
+        stopNotice = nil
+        microphoneAccessDenied = false
         defer { isPreparing = false }
 
         // Ask for mic access before touching AVAudioEngine — with access not
         // yet granted the input node reports an invalid HW format and CoreAudio
         // faults instead of prompting.
+        // macOS shows the permission prompt only while access is undetermined;
+        // once denied, the user has to turn it on in System Settings.
         status = "Requesting microphone access…"
-        let granted = await AVCaptureDevice.requestAccess(for: .audio)
+        let granted: Bool
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            granted = true
+        case .notDetermined:
+            granted = await AVCaptureDevice.requestAccess(for: .audio)
+        default:
+            granted = false
+        }
         guard granted else {
-            status = "Microphone access denied — enable it in System Settings → Privacy & Security → Microphone."
+            status = "MeetingNotes needs microphone access to record your side of the meeting. "
+                + "Turn on MeetingNotes in System Settings → Privacy & Security → Microphone, then try again."
             startError = status
+            microphoneAccessDenied = true
             return
         }
 
@@ -242,7 +313,9 @@ final class MeetingCoordinator: ObservableObject {
     }
 
     func stopMeeting(customTitle: String? = nil) async {
-        guard isRecording else { return }
+        guard isRecording, !isProcessing else { return }
+        isProcessing = true
+        defer { isProcessing = false }
         timerTask?.cancel()
         timerTask = nil
         mic.stop(); systemTap.stop()
@@ -260,6 +333,7 @@ final class MeetingCoordinator: ObservableObject {
         guard !liveTranscript.isEmpty else {
             currentNotes = nil
             status = "No speech captured — nothing was saved."
+            stopNotice = status
             return
         }
 
@@ -309,6 +383,46 @@ final class MeetingCoordinator: ObservableObject {
             liveUserNotes = ""
             calendarMeeting = nil
             lastSavedMeetingID = meeting.id
+        }
+    }
+
+    /// Opens System Settings → Privacy & Security → Microphone.
+    func openMicrophoneSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Saves the meeting in progress (or waits for the one being saved) before quitting.
+    func finishForQuit() async {
+        if isRecording {
+            await stopMeeting()
+        }
+        while isProcessing {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+    }
+
+    /// Re-runs the summary for a saved meeting, e.g. after summarization failed.
+    func regenerateNotes(for meetingID: UUID) async {
+        guard !isBusy, !regeneratingMeetingIDs.contains(meetingID),
+              let meeting = store.meetings.first(where: { $0.id == meetingID }),
+              !meeting.transcript.isEmpty else { return }
+        regeneratingMeetingIDs.insert(meetingID)
+        regenerateErrors[meetingID] = nil
+        defer { regeneratingMeetingIDs.remove(meetingID) }
+        do {
+            let notes = try await summarizer.summarize(
+                transcript: meeting.transcript,
+                attendees: meeting.attendees ?? [],
+                userNotes: meeting.userNotes ?? ""
+            )
+            // Re-read: the meeting may have been edited (or deleted) meanwhile.
+            guard var latest = store.meetings.first(where: { $0.id == meetingID }) else { return }
+            latest.notes = notes
+            store.update(latest)
+        } catch {
+            regenerateErrors[meetingID] = error.localizedDescription
         }
     }
 

@@ -135,7 +135,7 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                if coordinator.isPreparing {
+                if coordinator.isPreparing || coordinator.isProcessing {
                     ProgressView()
                         .controlSize(.mini)
                 } else {
@@ -152,7 +152,7 @@ struct MenuBarView: View {
             } else {
                 Button("Start Meeting Capture") { Task { await coordinator.startMeeting() } }
                     .keyboardShortcut("r", modifiers: [.command])
-                    .disabled(coordinator.isPreparing)
+                    .disabled(coordinator.isPreparing || coordinator.isProcessing)
             }
             Button("Open Meeting Notes") {
                 NSApp.setActivationPolicy(.regular)
@@ -200,6 +200,8 @@ struct ContentView: View {
     @State private var folderPrompt: FolderPrompt? = nil
     @State private var folderNameText = ""
     @State private var folderToDelete: String? = nil
+    /// Meeting awaiting delete confirmation (card trash icon / context menu).
+    @State private var meetingToDelete: Meeting? = nil
 
     private enum InsightsTab { case insights, ask }
 
@@ -404,6 +406,23 @@ struct ContentView: View {
             if let id = coordinator.lastSavedMeetingID {
                 selectedMeetingID = id
             }
+        }
+        .alert("Delete \"\(meetingToDelete?.displayTitle ?? "")\"?", isPresented: Binding(
+            get: { meetingToDelete != nil },
+            set: { if !$0 { meetingToDelete = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { meetingToDelete = nil }
+            Button("Delete", role: .destructive) {
+                if let meeting = meetingToDelete {
+                    if selectedMeetingID == meeting.id {
+                        selectedMeetingID = store.meetings.first(where: { $0.id != meeting.id })?.id
+                    }
+                    store.delete(meeting)
+                }
+                meetingToDelete = nil
+            }
+        } message: {
+            Text("The transcript, summary and your notes for this meeting will be permanently deleted. This can't be undone.")
         }
         .alert("Clear All Meetings?", isPresented: $showClearAllAlert) {
             Button("Cancel", role: .cancel) {}
@@ -697,7 +716,7 @@ struct ContentView: View {
                     Task { await coordinator.startMeeting() }
                 } label: {
                     HStack(spacing: 8) {
-                        if coordinator.isPreparing {
+                        if coordinator.isPreparing || coordinator.isProcessing {
                             ProgressView()
                                 .controlSize(.small)
                                 .colorScheme(.dark)   // light spinner on the blue button
@@ -705,7 +724,8 @@ struct ContentView: View {
                             Image(systemName: "mic.fill")
                                 .font(.system(size: 13, weight: .semibold))
                         }
-                        Text(coordinator.isPreparing ? "Preparing…" : "New Recording")
+                        Text(coordinator.isPreparing ? "Preparing…"
+                             : coordinator.isProcessing ? "Saving meeting…" : "New Recording")
                             .font(.system(size: 13, weight: .semibold))
                         Spacer()
                     }
@@ -725,10 +745,10 @@ struct ContentView: View {
                             .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
                     )
                     .shadow(color: Theme.primaryBlue.opacity(0.35), radius: 6, y: 2)
-                    .opacity(coordinator.isPreparing ? 0.8 : 1)
+                    .opacity(coordinator.isPreparing || coordinator.isProcessing ? 0.8 : 1)
                 }
                 .buttonStyle(.plain)
-                .disabled(coordinator.isPreparing)
+                .disabled(coordinator.isPreparing || coordinator.isProcessing)
                 .padding(.horizontal, 12)
                 .padding(.top, 12)
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -1117,6 +1137,48 @@ struct ContentView: View {
                         .foregroundStyle(Theme.fg.opacity(0.5))
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 380)
+                    HStack(spacing: 10) {
+                        if coordinator.microphoneAccessDenied {
+                            Button("Open Microphone Settings") { coordinator.openMicrophoneSettings() }
+                                .buttonStyle(.borderedProminent)
+                        }
+                        Button("Try Again") { Task { await coordinator.startMeeting() } }
+                            .disabled(coordinator.isBusy)
+                    }
+                    .controlSize(.regular)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if segments.isEmpty, selectedMeetingID == nil, coordinator.isProcessing {
+                VStack(spacing: 14) {
+                    Spacer()
+                    ProgressView()
+                        .controlSize(.large)
+                    Text(coordinator.status)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Theme.fg.opacity(0.75))
+                    Text("Your meeting is being processed on this Mac. It will open here as soon as it's saved.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.fg.opacity(0.35))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 360)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if segments.isEmpty, selectedMeetingID == nil, !coordinator.isRecording, let notice = coordinator.stopNotice {
+                VStack(spacing: 14) {
+                    Spacer()
+                    Image(systemName: "waveform.slash")
+                        .font(.system(size: 32))
+                        .foregroundStyle(Theme.fg.opacity(0.3))
+                    Text("Nothing was saved")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Theme.fg.opacity(0.75))
+                    Text(notice + " Check that your microphone and meeting audio are working, then start a new recording.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.fg.opacity(0.5))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 380)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1324,10 +1386,7 @@ struct ContentView: View {
                 store.togglePin(in: meeting.id)
             },
             onDelete: {
-                if selectedMeetingID == meeting.id {
-                    selectedMeetingID = store.meetings.first(where: { $0.id != meeting.id })?.id
-                }
-                store.delete(meeting)
+                meetingToDelete = meeting
             }
         )
         .contextMenu {
@@ -1343,11 +1402,8 @@ struct ContentView: View {
                 }
             }
             Divider()
-            Button("Delete", role: .destructive) {
-                if selectedMeetingID == meeting.id {
-                    selectedMeetingID = store.meetings.first(where: { $0.id != meeting.id })?.id
-                }
-                store.delete(meeting)
+            Button("Delete…", role: .destructive) {
+                meetingToDelete = meeting
             }
         }
     }
@@ -1379,6 +1435,44 @@ struct ContentView: View {
     }
 
     // MARK: - Executive Summary Card
+
+    /// Shown for a saved meeting with no AI notes (summarization failed or was
+    /// interrupted): explains it and offers to run the summary again.
+    private func summaryUnavailableView(for meeting: Meeting) -> some View {
+        let isRegenerating = coordinator.regeneratingMeetingIDs.contains(meeting.id)
+        let error = coordinator.regenerateErrors[meeting.id]
+        return VStack(alignment: .leading, spacing: 8) {
+            if isRegenerating {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Generating summary on-device…")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.fg.opacity(0.6))
+                }
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Color.orange)
+                    Text("Summary unavailable")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.fg.opacity(0.85))
+                }
+                Text(error.map { "The summary couldn't be generated: \($0)" }
+                     ?? "The transcript was saved, but the AI summary wasn't generated.")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.fg.opacity(0.5))
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Retry Summary") {
+                    Task { await coordinator.regenerateNotes(for: meeting.id) }
+                }
+                .controlSize(.small)
+                .disabled(coordinator.isBusy)
+                .help(coordinator.isBusy ? "Available once the current recording is saved" : "Generate the summary again")
+            }
+        }
+        .padding(.vertical, 4)
+    }
 
     private func executiveSummaryCard(notes: MeetingNotes?) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1445,6 +1539,17 @@ struct ContentView: View {
                         .foregroundStyle(Theme.fg.opacity(0.5))
                 }
                 .padding(.vertical, 4)
+            } else if selectedMeetingID == nil, coordinator.isProcessing {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(coordinator.status)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.fg.opacity(0.6))
+                }
+                .padding(.vertical, 4)
+            } else if let meeting = selectedMeeting, !meeting.transcript.isEmpty {
+                summaryUnavailableView(for: meeting)
             } else {
                 Text("Select a meeting from the sidebar or record a new one to generate AI insights.")
                     .font(.system(size: 12))

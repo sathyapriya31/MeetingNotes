@@ -21,6 +21,9 @@ cp ".build/$CONFIG/MeetingNotes" "$APP/Contents/MacOS/"
 # (-L: .build/<config> is a symlink to .build/arm64-apple-macosx/<config>)
 find -L ".build/$CONFIG" -maxdepth 1 -name "*.bundle" -exec cp -R {} "$APP/Contents/Resources/" \;
 
+# App icon (regenerate with: swift scripts/make-icon.swift)
+cp Assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -34,6 +37,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<string>com.spritle.meetingnotes</string>
 	<key>CFBundleExecutable</key>
 	<string>MeetingNotes</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

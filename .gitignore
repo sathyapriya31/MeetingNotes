@@ -10,7 +10,7 @@ packages/
 Package.resolved
 
 # Xcode (if project is opened in Xcode)
-*.xcodeproj/xcuserdata/
+**/xcuserdata/
 *.xcworkspace/xcuserdata/
 derivedData/
 DerivedData/
