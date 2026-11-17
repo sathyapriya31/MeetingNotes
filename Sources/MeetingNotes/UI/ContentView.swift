@@ -71,12 +71,22 @@ struct AppearancePicker: View {
     @AppStorage(AppAppearance.appearanceKey) private var appearance = AppAppearance.defaultValue
 
     var body: some View {
-        Picker("Appearance", selection: $appearance) {
+        // Apply in the binding's setter rather than `.onChange`: inside the header
+        // `Menu`, the picker is rebuilt whenever the coordinator publishes (every
+        // second while recording, on each status change while loading models), and
+        // a rebuilt `.onChange` treats the new value as its initial one and never
+        // fires — the stored value (and header icon) changed but the theme didn't.
+        Picker("Appearance", selection: Binding(
+            get: { appearance },
+            set: { newValue in
+                appearance = newValue
+                newValue.apply()
+            }
+        )) {
             ForEach(AppAppearance.allCases) { option in
                 Label(option.title, systemImage: option.symbol).tag(option)
             }
         }
-        .onChange(of: appearance) { appearance.apply() }
     }
 }
 
